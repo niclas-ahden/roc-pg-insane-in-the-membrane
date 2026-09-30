@@ -1,1 +1,5 @@
-package [Client, Pool, Cmd, PgResult, Bytes, ProtoBackend, ProtoFrontend] {}
+package [Client, Statement, Param, PgResult, ConnectionUrl] {
+	db: "https://github.com/niclas-ahden/roc-database-url/releases/download/0.4.0/6sKP47ivkLchhdvDMDe9ajVoiFPEP57ZgQoEy2WTDczX.tar.zst",
+	md5: "https://github.com/niclas-ahden/roc-md5/releases/download/0.1.0/qtnfgJ4Cys1MRonJBNztb83tiWbDn8peonUvaKWXhe4.tar.zst",
+	scram: "https://github.com/niclas-ahden/roc-scram/releases/download/0.1.0/5LZNjdSHw4qQtdQcfLy6P5B7dCA9gqa1c16TUZDA6gSz.tar.zst",
+}

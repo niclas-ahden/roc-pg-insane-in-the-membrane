@@ -17,3 +17,9 @@ report.xml
 
 # roc docs output
 generated-docs/
+
+# The catch-alls above ignore extensionless files, but this one must ship
+!LICENSE
+
+# Scratch files of the concurrency test in tests.roc
+.concurrent-test/

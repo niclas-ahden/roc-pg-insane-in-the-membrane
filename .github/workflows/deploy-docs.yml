@@ -8,10 +8,10 @@ on:
       - '**.roc'
       - 'docs/index.html'
       - '.github/workflows/deploy-docs.yml'
-  workflow_run:
-    workflows: ["Bundle"]
-    types:
-      - completed
+  # The docs.tar.gz was attached while the release was a draft, so it is
+  # there to serve.
+  release:
+    types: [published]
 
   workflow_dispatch:
 
@@ -20,11 +20,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The github-pages environment only accepts deployments from the default
+  # branch, and a release event runs on the tag, so hand the work to a run on
+  # main.
+  dispatch:
+    name: Deploy from main instead
+    if: github.event_name == 'release'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run deploy-docs.yml --ref main --repo "$GITHUB_REPOSITORY"
+
   deploy:
-    # A Bundle that failed uploaded no docs, so there is nothing new to publish.
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    if: github.event_name != 'release'
     permissions:
       contents: read
       pages: write
       id-token: write
-    uses: niclas-ahden/roc-workflows/.github/workflows/deploy-docs.yml@v2
+    uses: niclas-ahden/roc-workflows/.github/workflows/deploy-docs.yml@v3

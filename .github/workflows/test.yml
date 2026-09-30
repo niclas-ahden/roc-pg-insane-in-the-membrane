@@ -5,7 +5,41 @@ on:
     branches:
       - main
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  # The release gate: roc check, roc test, the bundle sanity check and
+  # ./tests.roc under the flake's compiler. tests.roc boots a throwaway
+  # Postgres from the dev shell.
+  #
+  # No examples here or in the legs below. They connect to a Postgres server
+  # on localhost:5432, and tests.roc checks them instead.
   test:
-    uses: niclas-ahden/roc-workflows/.github/workflows/test.yml@v2
+    name: Required
+    uses: niclas-ahden/roc-workflows/.github/workflows/test.yml@v3
+    with:
+      examples: ''
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+  roc-versions:
+    name: 'Optional: look up Roc versions'
+    uses: niclas-ahden/roc-workflows/.github/workflows/resolve-versions.yml@v3
+
+  # The newest downloaded nightly on every operating system, because that is
+  # the compiler a user of the package has. suite-setup.sh puts initdb and
+  # pg_ctl on the PATH for ./tests.roc.
+  latest-roc:
+    name: 'Optional: latest Roc'
+    needs: roc-versions
+    uses: niclas-ahden/roc-workflows/.github/workflows/suite.yml@v3
+    with:
+      roc: ${{ needs.roc-versions.outputs.nightly }}
+      label: Tests
+      examples: ''
+      setup: .github/scripts/suite-setup.sh
+      opts: '["speed", "dev", "size", "interpreter"]'

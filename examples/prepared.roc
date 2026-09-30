@@ -4,30 +4,22 @@
 ## Expects a Postgres server on localhost:5432 with a `postgres` user and
 ## database (adjust below). Run it with: roc examples/prepared.roc
 app [main!] {
-	pf: platform "https://github.com/niclas-ahden/basic-cli/releases/download/0.23.0/7NpDhuqoqGFedmVLvmm1zjq37GCmaFGzwr5sz4ch9wTK.tar.zst",
+	pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.23.0/GNN5tt2gKdX4dhawg4915C4YB193woHFdcCkz31fhGxv.tar.zst",
 	pg: "../package/main.roc",
 }
 
 import pf.Stdout
 import pf.Tcp
+import pf.Random
 import pg.Client
-import pg.Cmd
+import pg.Param
 import pg.PgResult
-
-effects = {
-	connect!: Tcp.connect!,
-	write!: Tcp.Stream.write!,
-	read_exactly!: Tcp.Stream.read_exactly!,
-	close!: Tcp.close!,
-	pool!: Tcp.pool!,
-	pool_acquire!: Tcp.pool_acquire!,
-	pool_release!: Tcp.pool_release!,
-}
 
 main! = |_args| {
 	client = Client.connect!(
-		effects,
 		{
+			connect!: Tcp.connect!,
+			random_u64!: Random.seed_u64!,
 			host: "localhost",
 			port: 5432,
 			user: "postgres",
@@ -39,17 +31,17 @@ main! = |_args| {
 
 	Stdout.line!("Connected!")?
 
-	add_cmd = Client.prepare!("select $1::int + $2::int as result", { name: "add", client })?
+	add_cmd = client.prepare!("select $1::int + $2::int as result", { name: "add" })?
 
 	add_and_print!(client, add_cmd, 1, 2)?
 	add_and_print!(client, add_cmd, 11, 31)?
 
-	Client.close!(client)
+	client.close!()
 	Ok({})
 }
 
 add_and_print! = |client, add_cmd, a, b| {
-	result = Client.command!(add_cmd.bind([Cmd.i32(a), Cmd.i32(b)]), client)?
+	result = client.command!(add_cmd.bind([Param.i32(a), Param.i32(b)]))?
 	sum = PgResult.decode_one(result, |row| row.i32("result"))?
 	Stdout.line!("${a.to_str()} + ${b.to_str()} = ${sum.to_str()}")?
 	Ok({})

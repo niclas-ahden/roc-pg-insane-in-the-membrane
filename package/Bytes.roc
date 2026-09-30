@@ -37,14 +37,14 @@ Bytes :: [].{
 
 	# ---- Decoding ----
 
-	take_u8 : List(U8) -> Try({ val : U8, rest : List(U8) }, [UnexpectedEnd, ..])
+	take_u8 : List(U8) -> Try({ val : U8, rest : List(U8) }, [UnexpectedEnd])
 	take_u8 = |bytes|
 		match bytes.get(0) {
 			Ok(b) => Ok({ val: b, rest: bytes.drop_first(1) })
 			Err(_) => Err(UnexpectedEnd)
 		}
 
-	take_u16 : List(U8) -> Try({ val : U16, rest : List(U8) }, [UnexpectedEnd, ..])
+	take_u16 : List(U8) -> Try({ val : U16, rest : List(U8) }, [UnexpectedEnd])
 	take_u16 = |bytes| {
 		b0 = bytes.get(0).map_err(|_| UnexpectedEnd)?
 		b1 = bytes.get(1).map_err(|_| UnexpectedEnd)?
@@ -52,7 +52,7 @@ Bytes :: [].{
 		Ok({ val, rest: bytes.drop_first(2) })
 	}
 
-	take_u32 : List(U8) -> Try({ val : U32, rest : List(U8) }, [UnexpectedEnd, ..])
+	take_u32 : List(U8) -> Try({ val : U32, rest : List(U8) }, [UnexpectedEnd])
 	take_u32 = |bytes| {
 		b0 = bytes.get(0).map_err(|_| UnexpectedEnd)?
 		b1 = bytes.get(1).map_err(|_| UnexpectedEnd)?
@@ -66,20 +66,20 @@ Bytes :: [].{
 		Ok({ val, rest: bytes.drop_first(4) })
 	}
 
-	take_i16 : List(U8) -> Try({ val : I16, rest : List(U8) }, [UnexpectedEnd, ..])
+	take_i16 : List(U8) -> Try({ val : I16, rest : List(U8) }, [UnexpectedEnd])
 	take_i16 = |bytes| {
 		{ val, rest } = Bytes.take_u16(bytes)?
 		Ok({ val: val.to_i16_wrap(), rest })
 	}
 
-	take_i32 : List(U8) -> Try({ val : I32, rest : List(U8) }, [UnexpectedEnd, ..])
+	take_i32 : List(U8) -> Try({ val : I32, rest : List(U8) }, [UnexpectedEnd])
 	take_i32 = |bytes| {
 		{ val, rest } = Bytes.take_u32(bytes)?
 		Ok({ val: val.to_i32_wrap(), rest })
 	}
 
 	## Take `count` bytes.
-	take : List(U8), U64 -> Try({ val : List(U8), rest : List(U8) }, [UnexpectedEnd, ..])
+	take : List(U8), U64 -> Try({ val : List(U8), rest : List(U8) }, [UnexpectedEnd])
 	take = |bytes, count|
 		if bytes.len() < count {
 			Err(UnexpectedEnd)
@@ -88,7 +88,7 @@ Bytes :: [].{
 		}
 
 	## Take a null-terminated string (the terminator is consumed, not returned).
-	take_c_str : List(U8) -> Try({ val : Str, rest : List(U8) }, [TerminatorNotFound, BadUtf8, ..])
+	take_c_str : List(U8) -> Try({ val : Str, rest : List(U8) }, [TerminatorNotFound, BadUtf8])
 	take_c_str = |bytes|
 		match bytes.split_first(0) {
 			Ok({ before, after }) =>
