@@ -101,26 +101,8 @@ parse_one = |raw, toks| {
 		Ok([]) => Ok(Node.Null)
 		Ok(_) => Err("cannot insert multiple commands into a prepared statement")
 		Err(problem) if problem.cursor == 0 => Err(problem.message)
-		Err(problem) => Err("${problem.message} (${Lex.position(raw, cursor_offset(bytes, problem.cursor))})")
+		Err(problem) => Err("${problem.message} (${Lex.position(raw, Lex.cursor_offset(bytes, problem.cursor))})")
 	}
-}
-
-## The byte offset of a server cursor, a 1-based character position.
-cursor_offset : List(U8), U64 -> U64
-cursor_offset = |bytes, cursor| {
-	var $chars = 0
-	var $i = 0
-	while $i < bytes.len() {
-		b = bytes.get($i) ?? 0
-		if b < 0x80 or b >= 0xC0 {
-			$chars = $chars + 1
-			if $chars == cursor {
-				return $i
-			}
-		}
-		$i = $i + 1
-	}
-	bytes.len()
 }
 
 ## The first mismatch between the placeholders and the parameter record.
@@ -175,7 +157,7 @@ is_positional = |kind|
 	}
 
 test_catalog : Catalog
-test_catalog = Catalog.parse("CREATE TABLE public.students (id integer NOT NULL, name text NOT NULL, phone text, school_id integer NOT NULL);") ?? Catalog.empty
+test_catalog = Catalog.parse("CREATE TABLE public.students (id integer NOT NULL, name text NOT NULL, phone text, school_id integer NOT NULL);") ?? Catalog.none
 
 field : Str, Str, Bool -> RowFormat.Field
 field = |name, kind, nullable| { name, kind, nullable }
@@ -223,3 +205,5 @@ expect typed("select id from students where lower(name) = lower($n)", [field("n"
 expect typed("select id from students where lower(name) = $n", [field("n", "Bool", Bool.False)]) == Err("`$n` is `Bool`, but `=` takes `text` there")
 expect typed("select id from students where ($min::integer is null or id >= $min)", [field("min", "Dec", Bool.True)]) == Err("`$min` is `Dec`, but the cast takes `integer` there")
 expect typed("select id from students where name = $id::text", [field("id", "I32", Bool.False)]) == Ok({ text: "select id from students where name = $1::text", params: ["id"] })
+expect check("select id from students", Catalog.none, [], [field("id", "I32", Bool.False)]) == Ok({ text: "select id from students", params: [] })
+expect check("select id from students", Catalog.parse("") ?? Catalog.none, [], []) == Err("table `students` does not exist in the schema")

@@ -210,6 +210,24 @@ Lex :: [].{
 		"line ${$line.to_str()}, column ${$column.to_str()}"
 	}
 
+	## The byte offset of a server cursor, a 1-based character position.
+	cursor_offset : List(U8), U64 -> U64
+	cursor_offset = |bytes, cursor| {
+		var $chars = 0
+		var $i = 0
+		while $i < bytes.len() {
+			b = bytes.get($i) ?? 0
+			if b < 0x80 or b >= 0xC0 {
+				$chars = $chars + 1
+				if $chars == cursor {
+					return $i
+				}
+			}
+			$i = $i + 1
+		}
+		bytes.len()
+	}
+
 	## The source text of a token.
 	token_text : Str, Lex.Token -> Str
 	token_text = |sql, tok| text(sql.to_utf8(), tok.start, tok.end)

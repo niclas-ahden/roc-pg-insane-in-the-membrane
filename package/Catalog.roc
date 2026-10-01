@@ -25,12 +25,13 @@
 ## Dump the schema again after each migration. Each statement that
 ## describes a table, a view, an enum, a domain or a function is read with
 ## Postgres's own grammar. Everything else in the dump (indexes, sequences,
-## grants, comments) is skipped, and so is a statement the grammar refuses.
+## grants, comments) is skipped. A statement it reads that the grammar
+## refuses stops the build, as the dump is then not what `pg_dump` wrote.
 import Lex
 import Node
 import Parse
 
-Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions : List(Catalog.Function), extensions : List(Str) }.{
+Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions : List(Catalog.Function), extensions : List(Str), none : Bool }.{
 	## A table or a view. A view's columns are the ones its query returns,
 	## which the analysis works out when a query reads it. `primary_key` is
 	## empty for a table without one. `triggers` is whether a trigger is
@@ -53,11 +54,14 @@ Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions
 	## columns.
 	Function : { name : Str, args : List(Str), defaults : U64, variadic : Bool, result : Str, set : Bool, strict : Bool, outputs : List({ name : Str, type : Str }) }
 
-	empty : Catalog
-	empty = Catalog.{ tables: [], enums: [], functions: [], extensions: [] }
+	## No schema, the catalog of [NoSchema]. Queries are checked for syntax
+	## and parameters, but any table, column or function goes. A dump without
+	## tables is not this: its queries can name no table.
+	none : Catalog
+	none = Catalog.{ tables: [], enums: [], functions: [], extensions: [], none: Bool.True }
 
-	is_empty : Catalog -> Bool
-	is_empty = |catalog| catalog.tables.is_empty()
+	is_none : Catalog -> Bool
+	is_none = |catalog| catalog.none
 
 	tables : Catalog -> List(Catalog.Table)
 	tables = |catalog| catalog.tables
@@ -95,7 +99,8 @@ Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions
 			Err(BadSchema(message)) => crash "schema.sql: ${message}"
 		}
 
-	## Read a schema dump. Fails only when the text does not lex as SQL.
+	## Read a schema dump. Fails when the text does not lex as SQL, or when a
+	## statement that describes the schema is not valid SQL.
 	parse : Str -> Try(Catalog, [BadSchema(Str)])
 	parse = |dump| {
 		sql = without_meta_commands(dump)
@@ -148,7 +153,11 @@ Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions
 							}
 							_ => {}
 						}
-					_ => {}
+					Ok(_) => {}
+					Err(problem) => {
+						at = statement.start + Lex.cursor_offset(statement.text.to_utf8(), problem.cursor)
+						return Err(BadSchema("${problem.message} (${Lex.position(sql, at)})"))
+					}
 				}
 			}
 		}
@@ -160,7 +169,7 @@ Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions
 					_ => t
 				},
 		)
-		Ok(Catalog.{ tables: resolved, enums: $enums, functions: $functions, extensions: $extensions })
+		Ok(Catalog.{ tables: resolved, enums: $enums, functions: $functions, extensions: $extensions, none: Bool.False })
 	}
 
 	## The type a `TypeName` node names, spelled as `pg_dump` spells column
@@ -208,12 +217,14 @@ resolve_domain = |column, domains|
 	}
 
 ## `pg_dump` 17.6 and later put psql's `\restrict` and `\unrestrict` around
-## the dump. They are not SQL.
+## the dump. They are not SQL. Their lines are blanked rather than dropped,
+## so a position in an error is still a position in the file.
 without_meta_commands : Str -> Str
-without_meta_commands = |sql| Str.join_with(sql.split_on("\n").drop_if(|line| line.starts_with("\\")), "\n")
+without_meta_commands = |sql| Str.join_with(sql.split_on("\n").map(|line| if line.starts_with("\\") "" else line), "\n")
 
-## The statements of a dump: the text of each, and its tokens' kinds.
-statements : Str, List(Lex.Token) -> List({ text : Str, kinds : List(Lex.Kind) })
+## The statements of a dump: the text of each, where it starts and its
+## tokens' kinds.
+statements : Str, List(Lex.Token) -> List({ text : Str, start : U64, kinds : List(Lex.Kind) })
 statements = |sql, toks| {
 	bytes = sql.to_utf8()
 	var $out = []
@@ -223,7 +234,7 @@ statements = |sql, toks| {
 			match ($current.first(), $current.last()) {
 				(Ok(first), Ok(last)) => {
 					text = Str.from_utf8_lossy(bytes.sublist({ start: first.start, len: last.end - first.start }))
-					$out = $out.append({ text, kinds: $current.map(|t| t.kind) })
+					$out = $out.append({ text, start: first.start, kinds: $current.map(|t| t.kind) })
 				}
 				_ => {}
 			}
@@ -460,7 +471,7 @@ sample =
 	\\\\unrestrict abc123
 
 expect {
-	catalog = Catalog.parse(sample) ?? Catalog.empty
+	catalog = Catalog.parse(sample) ?? Catalog.none
 	catalog.enums() == ["access_level"]
 	and catalog.enum_labels("access_level") == Ok(["Viewer", "Editor"])
 	and catalog.table("students").map_ok(|t| t.columns)
@@ -483,7 +494,7 @@ expect {
 }
 
 expect {
-	catalog = Catalog.parse(sample) ?? Catalog.empty
+	catalog = Catalog.parse(sample) ?? Catalog.none
 	match catalog.table("active_students") {
 		Ok({ columns: View(_), .. }) => Bool.True
 		_ => Bool.False
@@ -491,7 +502,7 @@ expect {
 }
 
 expect {
-	catalog = Catalog.parse(sample) ?? Catalog.empty
+	catalog = Catalog.parse(sample) ?? Catalog.none
 	catalog.functions()
 	== [
 		{ name: "full_name", args: ["text", "text"], defaults: 1, variadic: Bool.False, result: "text", set: Bool.False, strict: Bool.True, outputs: [] },
@@ -506,7 +517,7 @@ expect {
 		\\CREATE TABLE public.events (id bigint NOT NULL, at timestamp with time zone DEFAULT now() NOT NULL, n integer GENERATED ALWAYS AS (1) STORED);
 		\\ALTER TABLE public.events ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME public.events_id_seq START WITH 1);
 		\\CREATE TRIGGER stamp BEFORE INSERT ON public.events FOR EACH ROW EXECUTE FUNCTION public.stamp();
-	catalog = Catalog.parse(dump) ?? Catalog.empty
+	catalog = Catalog.parse(dump) ?? Catalog.none
 	catalog.extensions() == ["pgcrypto"]
 	and catalog.table("events").map_ok(|t| (t.columns, t.triggers))
 	== Ok(
@@ -522,3 +533,9 @@ expect {
 		),
 	)
 }
+
+expect Catalog.parse("CREATE TABLE public.planets (\n    id integer NOT NULL,\n);").map_ok(|_| {}) == Err(BadSchema("syntax error at or near \")\" (line 3, column 1)"))
+expect Catalog.parse("\\restrict abc\nCREATE TYPE public.mood AS ENUM ('ok');\nCREATE TABLE public.x (id integer,);").map_ok(|_| {}) == Err(BadSchema("syntax error at or near \")\" (line 3, column 35)"))
+expect Catalog.parse("CREATE TABLE public.x (id integer); CREATE INDEX nope ON;").map_ok(|c| c.tables().len()) == Ok(1)
+expect Catalog.parse("").map_ok(|c| c.is_none()) == Ok(Bool.False)
+expect Catalog.none.is_none()

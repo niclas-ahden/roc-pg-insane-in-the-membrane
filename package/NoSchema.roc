@@ -9,5 +9,5 @@ import Catalog
 
 NoSchema := [].{
 	catalog : {} -> Catalog
-	catalog = |{}| Catalog.empty
+	catalog = |{}| Catalog.none
 }

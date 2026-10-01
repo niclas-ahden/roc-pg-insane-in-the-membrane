@@ -686,7 +686,7 @@ table_columns = |name, env, qualified| {
 						Unknown => { columns: Unknown, problems: [] }
 					}
 				Err(_) =>
-					if env.catalog.is_empty() {
+					if env.catalog.is_none() {
 						{ columns: Unknown, problems: [] }
 					} else {
 						{ columns: Unknown, problems: ["table `${name}` does not exist in the schema${Check.suggestion(name, env.catalog.tables().map(|t| t.name).concat(env.ctes.map(|c| c.name)))}"] }
@@ -1340,7 +1340,7 @@ expression_problems = |node, rels, env| {
 ## operators and casts this does not know, and without a schema the
 ## database may have functions of its own.
 refuses_calls : Env -> Bool
-refuses_calls = |env| !env.catalog.is_empty() and env.catalog.extensions().is_empty()
+refuses_calls = |env| !env.catalog.is_none() and env.catalog.extensions().is_empty()
 
 ## How an argument reads in a message: its type, or `unknown` for a string
 ## literal, NULL or a parameter.
@@ -1930,7 +1930,7 @@ test_schema =
 	\\    LANGUAGE sql AS $$ select 1, 'a' $$;
 
 test_catalog : Catalog
-test_catalog = Catalog.parse(test_schema) ?? Catalog.empty
+test_catalog = Catalog.parse(test_schema) ?? Catalog.none
 
 check : Str -> Check.Result
 check = |sql| {
