@@ -31,7 +31,7 @@ main! = |_args| {
 
 	Stdout.line!("Connected!")?
 
-	add_cmd = client.prepare!("select $1::int + $2::int as result", { name: "add" })?
+	add_cmd = client.prepare_unchecked!("select $1::int + $2::int as result", { name: "add" })?
 
 	add_and_print!(client, add_cmd, 1, 2)?
 	add_and_print!(client, add_cmd, 11, 31)?

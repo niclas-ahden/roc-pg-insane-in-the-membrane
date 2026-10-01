@@ -85,7 +85,7 @@ check = |label, ok| if ok Ok({}) else Err(TestFailed(label))
 
 ## Every row accessor type against literal Postgres values.
 test_decoding! = |client| {
-	cmd = Statement.new("select 'hello' as s, 250::int2 as small, -7::int as i, 9000000000::int8 as big, 2.5::float8 as f, 2.25::float4 as f4, 1.25::numeric as d, true as t, false as f2, 'raw'::bytea as b")
+	cmd = Statement.new_unchecked("select 'hello' as s, 250::int2 as small, -7::int as i, 9000000000::int8 as big, 2.5::float8 as f, 2.25::float4 as f4, 1.25::numeric as d, true as t, false as f2, 'raw'::bytea as b")
 	result = client.command!(cmd)?
 	row = PgResult.decode_one(
 		result,
@@ -122,14 +122,14 @@ test_decoding! = |client| {
 ## value from 0 to 255 included.
 test_bytea_round_trip! = |client| {
 	sent = List.repeat({}, 256).map_with_index(|_, n| n.to_u8_wrap())
-	back = client.query_one!("select $1::bytea as b", [Param.bytes(sent)], |row| row.bytes("b"))?
+	back = client.query_one_unchecked!("select $1::bytea as b", [Param.bytes(sent)], |row| row.bytes("b"))?
 	check("bytea round trip", back == sent)?
 	Stdout.line!("ok: bytea round trip")
 }
 
 ## The nullable accessors return Null for NULL and Present otherwise.
 test_nulls! = |client| {
-	cmd = Statement.new("select null::text as no_s, 'x' as yes_s, null::int as no_i, 5::int as yes_i, null::bool as no_b, true as yes_b, null::bytea as no_by, 'raw'::bytea as yes_by, null::int2 as no_u8, 250::int2 as yes_u8, null::int8 as no_u64, 9000000000::int8 as yes_u64")
+	cmd = Statement.new_unchecked("select null::text as no_s, 'x' as yes_s, null::int as no_i, 5::int as yes_i, null::bool as no_b, true as yes_b, null::bytea as no_by, 'raw'::bytea as yes_by, null::int2 as no_u8, 250::int2 as yes_u8, null::int8 as no_u64, 9000000000::int8 as yes_u64")
 	result = client.command!(cmd)?
 	row = PgResult.decode_one(
 		result,
@@ -169,11 +169,11 @@ test_nulls! = |client| {
 ## DDL and DML: create a table, insert with bindings (including a NULL),
 ## and read the rows back.
 test_table_round_trip! = |client| {
-	_ = client.command!(Statement.new("create temp table people (name text not null, age int)"))?
-	insert = Statement.new("insert into people (name, age) values ($1, $2), ($3, $4)")
+	_ = client.command!(Statement.new_unchecked("create temp table people (name text not null, age int)"))?
+	insert = Statement.new_unchecked("insert into people (name, age) values ($1, $2), ($3, $4)")
 	_ = client.command!(insert.bind([Param.str("John"), Param.u8(25), Param.str("Julio"), Param.null]))?
 
-	result = client.command!(Statement.new("select name, age from people order by name"))?
+	result = client.command!(Statement.new_unchecked("select name, age from people order by name"))?
 	people = PgResult.decode(
 		result,
 		|r| {
@@ -190,24 +190,24 @@ test_table_round_trip! = |client| {
 ## A failing command must not desync the connection: the client drains the
 ## conversation to ReadyForQuery, so the next command still works.
 test_error_recovery! = |client| {
-	match client.command!(Statement.new("select nope from does_not_exist")) {
+	match client.command!(Statement.new_unchecked("select nope from does_not_exist")) {
 		Ok(_) => Err(TestFailed("query of missing table should fail"))
 		Err(PgErr(error)) => check("error code", error.code == "42P01")
 		Err(other) => Err(other)
 	}?
 
-	after_error = client.command!(Statement.new("select 1 as one"))?
+	after_error = client.command!(Statement.new_unchecked("select 1 as one"))?
 	one = PgResult.decode_one(after_error, |r| r.i32("one"))?
 	check("query after error", one == 1)?
 
 	# The same drain applies to a failed prepare.
-	match client.prepare!("select syntax error (", { name: "broken" }) {
+	match client.prepare_unchecked!("select syntax error (", { name: "broken" }) {
 		Ok(_) => Err(TestFailed("preparing broken sql should fail"))
 		Err(PgErr(_)) => Ok({})
 		Err(other) => Err(other)
 	}?
 
-	after_prepare_error = client.command!(Statement.new("select 2 as two"))?
+	after_prepare_error = client.command!(Statement.new_unchecked("select 2 as two"))?
 	two = PgResult.decode_one(after_prepare_error, |r| r.i32("two"))?
 	check("query after prepare error", two == 2)?
 	Stdout.line!("ok: error recovery")
@@ -218,15 +218,15 @@ test_error_recovery! = |client| {
 ## surfaces at the implicit commit on Sync. command! must report that error,
 ## and the drain must leave the connection usable.
 test_commit_error! = |client| {
-	_ = client.command!(Statement.new("create temp table deferred_unique (i int unique deferrable initially deferred)"))?
+	_ = client.command!(Statement.new_unchecked("create temp table deferred_unique (i int unique deferrable initially deferred)"))?
 
-	match client.command!(Statement.new("insert into deferred_unique values (1), (1)")) {
+	match client.command!(Statement.new_unchecked("insert into deferred_unique values (1), (1)")) {
 		Ok(_) => Err(TestFailed("deferred constraint violation should fail at commit"))
 		Err(PgErr(error)) => check("commit error code", error.code == "23505")
 		Err(other) => Err(other)
 	}?
 
-	after = client.command!(Statement.new("select 3 as three"))?
+	after = client.command!(Statement.new_unchecked("select 3 as three"))?
 	three = PgResult.decode_one(after, |r| r.i32("three"))?
 	check("query after commit error", three == 3)?
 	Stdout.line!("ok: commit-time error")
@@ -234,7 +234,7 @@ test_commit_error! = |client| {
 
 ## Prepared statements run many times with fresh bindings.
 test_prepared! = |client| {
-	add_cmd = client.prepare!("select $1::int + $2::int as result", { name: "add" })?
+	add_cmd = client.prepare_unchecked!("select $1::int + $2::int as result", { name: "add" })?
 
 	first = client.command!(add_cmd.bind([Param.i32(1), Param.i32(2)]))?
 	first_sum = PgResult.decode_one(first, |r| r.i32("result"))?
@@ -245,7 +245,7 @@ test_prepared! = |client| {
 	check("prepared second run", second_sum == 42)?
 
 	# Re-preparing the same name replaces the old statement.
-	sub_cmd = client.prepare!("select $1::int - $2::int as result", { name: "add" })?
+	sub_cmd = client.prepare_unchecked!("select $1::int - $2::int as result", { name: "add" })?
 	replaced = client.command!(sub_cmd.bind([Param.i32(11), Param.i32(31)]))?
 	replaced_result = PgResult.decode_one(replaced, |r| r.i32("result"))?
 	check("prepared replaced", replaced_result == -20)?
@@ -255,16 +255,16 @@ test_prepared! = |client| {
 ## transaction! commits a body that succeeds and rolls back one that fails.
 ## query! and execute! are command! with the encoding and decoding done.
 test_transaction! = |client| {
-	_ = client.execute!("create temp table tx_people (name text)", [])?
+	_ = client.execute_unchecked!("create temp table tx_people (name text)", [])?
 	inserted = client.transaction!(|db| {
-		_ = db.execute!("insert into tx_people (name) values ($1)", [Param.str("Ada")])?
-		db.query!("select count(*)::int as n from tx_people", [], |row| row.i32("n"))
+		_ = db.execute_unchecked!("insert into tx_people (name) values ($1)", [Param.str("Ada")])?
+		db.query_unchecked!("select count(*)::int as n from tx_people", [], |row| row.i32("n"))
 	})?
 	check("transaction! commits", inserted == [1])?
 
 	rolled_back = client.transaction!(|db| {
-		_ = db.execute!("insert into tx_people (name) values ($1)", [Param.str("Grace")])?
-		_ = db.command!(Statement.new("select nope from does_not_exist"))?
+		_ = db.execute_unchecked!("insert into tx_people (name) values ($1)", [Param.str("Grace")])?
+		_ = db.command!(Statement.new_unchecked("select nope from does_not_exist"))?
 		Ok({})
 	})
 	match rolled_back {
@@ -272,7 +272,7 @@ test_transaction! = |client| {
 		Err(PgErr(error)) => check("transaction! passes the body error through", error.code == "42P01")
 		Err(other) => Err(other)
 	}?
-	after = client.query!("select count(*)::int as n from tx_people", [], |row| row.i32("n"))?
+	after = client.query_unchecked!("select count(*)::int as n from tx_people", [], |row| row.i32("n"))?
 	check("transaction! rolls back the failed body", after == [1])?
 	check("transaction! leaves the session idle", client.sync_status!()? == Idle)?
 	Stdout.line!("ok: transaction")
@@ -282,10 +282,10 @@ test_transaction! = |client| {
 ## the server rolls the transaction back at `commit`, and transaction!
 ## reports that instead of the body's value.
 test_transaction_aborted! = |client| {
-	_ = client.execute!("create temp table aborted_people (name text)", [])?
+	_ = client.execute_unchecked!("create temp table aborted_people (name text)", [])?
 	aborted = client.transaction!(|db| {
-		_ = db.execute!("insert into aborted_people (name) values ($1)", [Param.str("Ada")])?
-		_ = db.execute!("select nope from does_not_exist", [])
+		_ = db.execute_unchecked!("insert into aborted_people (name) values ($1)", [Param.str("Ada")])?
+		_ = db.execute_unchecked!("select nope from does_not_exist", [])
 		Ok("done")
 	})
 	match aborted {
@@ -295,7 +295,7 @@ test_transaction_aborted! = |client| {
 	}?
 	check("an aborted transaction commits nothing", nested_count!(client, "aborted_people")? == 0)?
 	check("an aborted transaction leaves the session idle", client.sync_status!()? == Idle)?
-	_ = client.execute!("drop table aborted_people", [])?
+	_ = client.execute_unchecked!("drop table aborted_people", [])?
 	Stdout.line!("ok: transaction aborted")
 }
 
@@ -305,37 +305,37 @@ test_transaction_aborted! = |client| {
 ## call goes through the outer connection too, as a body that closes over
 ## it does.
 test_nested_transactions! = |client| {
-	_ = client.execute!("create temp table nested (name text)", [])?
+	_ = client.execute_unchecked!("create temp table nested (name text)", [])?
 
 	# Both levels succeed and both land.
 	count = client.transaction!(|outer| {
-		_ = outer.execute!("insert into nested values ($1)", [Param.str("a")])?
-		outer.transaction!(|inner| inner.execute!("insert into nested values ($1)", [Param.str("b")]))
+		_ = outer.execute_unchecked!("insert into nested values ($1)", [Param.str("a")])?
+		outer.transaction!(|inner| inner.execute_unchecked!("insert into nested values ($1)", [Param.str("b")]))
 	})?
 	check("nested: the inner value comes through", count == 1)?
 	check("nested: both levels commit", nested_names!(client)? == ["a", "b"])?
-	_ = client.execute!("delete from nested", [])?
+	_ = client.execute_unchecked!("delete from nested", [])?
 
 	# The inner call fails, the outer one carries on.
 	_ = client.transaction!(|outer| {
-		_ = outer.execute!("insert into nested values ($1)", [Param.str("a")])?
+		_ = outer.execute_unchecked!("insert into nested values ($1)", [Param.str("a")])?
 		inner = outer.transaction!(|db| {
-			_ = db.execute!("insert into nested values ($1)", [Param.str("b")])?
-			db.execute!("select nope from does_not_exist", [])
+			_ = db.execute_unchecked!("insert into nested values ($1)", [Param.str("b")])?
+			db.execute_unchecked!("select nope from does_not_exist", [])
 		})
 		check("nested: the inner failure comes through", Try.is_err(inner))?
-		outer.execute!("insert into nested values ($1)", [Param.str("c")])
+		outer.execute_unchecked!("insert into nested values ($1)", [Param.str("c")])
 	})?
 	check("nested: a failed inner call undoes only its own work", nested_names!(client)? == ["a", "c"])?
-	_ = client.execute!("delete from nested", [])?
+	_ = client.execute_unchecked!("delete from nested", [])?
 
 	# The inner body catches a failed statement and returns Ok. The inner
 	# call reports the abort and the outer transaction is still usable.
 	_ = client.transaction!(|outer| {
-		_ = outer.execute!("insert into nested values ($1)", [Param.str("a")])?
+		_ = outer.execute_unchecked!("insert into nested values ($1)", [Param.str("a")])?
 		inner = outer.transaction!(|db| {
-			_ = db.execute!("insert into nested values ($1)", [Param.str("b")])?
-			_ = db.execute!("select nope from does_not_exist", [])
+			_ = db.execute_unchecked!("insert into nested values ($1)", [Param.str("b")])?
+			_ = db.execute_unchecked!("select nope from does_not_exist", [])
 			Ok({})
 		})
 		aborted =
@@ -344,57 +344,57 @@ test_nested_transactions! = |client| {
 				_ => Bool.False
 			}
 		check("nested: a caught failure aborts the inner call", aborted)?
-		outer.execute!("insert into nested values ($1)", [Param.str("c")])
+		outer.execute_unchecked!("insert into nested values ($1)", [Param.str("c")])
 	})?
 	check("nested: the outer transaction goes on after an inner abort", nested_names!(client)? == ["a", "c"])?
-	_ = client.execute!("delete from nested", [])?
+	_ = client.execute_unchecked!("delete from nested", [])?
 
 	# Three levels, the innermost fails and the middle one carries on, so
 	# each release and rollback finds its own savepoint.
 	_ = client.transaction!(|top| {
-		_ = top.execute!("insert into nested values ($1)", [Param.str("a")])?
+		_ = top.execute_unchecked!("insert into nested values ($1)", [Param.str("a")])?
 		_ = top.transaction!(|middle| {
-			_ = middle.execute!("insert into nested values ($1)", [Param.str("b")])?
+			_ = middle.execute_unchecked!("insert into nested values ($1)", [Param.str("b")])?
 			_ = middle.transaction!(|bottom| {
-				_ = bottom.execute!("insert into nested values ($1)", [Param.str("x")])?
-				bottom.execute!("select nope from does_not_exist", [])
+				_ = bottom.execute_unchecked!("insert into nested values ($1)", [Param.str("x")])?
+				bottom.execute_unchecked!("select nope from does_not_exist", [])
 			})
-			middle.execute!("insert into nested values ($1)", [Param.str("c")])
+			middle.execute_unchecked!("insert into nested values ($1)", [Param.str("c")])
 		})?
-		top.execute!("insert into nested values ($1)", [Param.str("d")])
+		top.execute_unchecked!("insert into nested values ($1)", [Param.str("d")])
 	})?
 	check("nested: three levels", nested_names!(client)? == ["a", "b", "c", "d"])?
-	_ = client.execute!("delete from nested", [])?
+	_ = client.execute_unchecked!("delete from nested", [])?
 
 	# A nested call that succeeded is still undone when the outer one fails.
 	outer_failed = client.transaction!(|outer| {
-		_ = outer.transaction!(|db| db.execute!("insert into nested values ($1)", [Param.str("a")]))?
-		outer.execute!("select nope from does_not_exist", [])
+		_ = outer.transaction!(|db| db.execute_unchecked!("insert into nested values ($1)", [Param.str("a")]))?
+		outer.execute_unchecked!("select nope from does_not_exist", [])
 	})
 	check("nested: the outer failure comes through", Try.is_err(outer_failed))?
 	check("nested: an outer failure undoes a nested success", nested_names!(client)? == [])?
 
 	# Nesting through the outer connection instead of the body's.
 	_ = client.transaction!(|_| {
-		_ = client.execute!("insert into nested values ($1)", [Param.str("a")])?
+		_ = client.execute_unchecked!("insert into nested values ($1)", [Param.str("a")])?
 		_ = client.transaction!(|_| {
-			_ = client.execute!("insert into nested values ($1)", [Param.str("b")])?
-			client.execute!("select nope from does_not_exist", [])
+			_ = client.execute_unchecked!("insert into nested values ($1)", [Param.str("b")])?
+			client.execute_unchecked!("select nope from does_not_exist", [])
 		})
-		client.execute!("insert into nested values ($1)", [Param.str("c")])
+		client.execute_unchecked!("insert into nested values ($1)", [Param.str("c")])
 	})?
 	check("nested through the outer connection: only the inner work is undone", nested_names!(client)? == ["a", "c"])?
-	_ = client.execute!("delete from nested", [])?
+	_ = client.execute_unchecked!("delete from nested", [])?
 
 	outer_connection_failed = client.transaction!(|_| {
-		_ = client.transaction!(|_| client.execute!("insert into nested values ($1)", [Param.str("a")]))?
-		client.execute!("select nope from does_not_exist", [])
+		_ = client.transaction!(|_| client.execute_unchecked!("insert into nested values ($1)", [Param.str("a")]))?
+		client.execute_unchecked!("select nope from does_not_exist", [])
 	})
 	check("nested through the outer connection: the outer failure comes through", Try.is_err(outer_connection_failed))?
 	check("nested through the outer connection: the inner call did not commit early", nested_names!(client)? == [])?
 
 	check("nested: the session ends idle", client.sync_status!()? == Idle)?
-	_ = client.execute!("drop table nested", [])?
+	_ = client.execute_unchecked!("drop table nested", [])?
 	Stdout.line!("ok: nested transactions")
 }
 
@@ -404,42 +404,42 @@ test_nested_transactions! = |client| {
 ## which needs the superuser and the log file ./tests.roc sets up.
 test_nested_transactions_quiet! = |client| {
 	before = log_size!(client)?
-	_ = client.transaction!(|outer| outer.transaction!(|inner| inner.transaction!(|db| db.execute!("select 1", []))))?
+	_ = client.transaction!(|outer| outer.transaction!(|inner| inner.transaction!(|db| db.execute_unchecked!("select 1", []))))?
 	_ = client.transaction!(|outer| {
-		_ = outer.transaction!(|db| db.execute!("select nope from does_not_exist", []))
-		outer.execute!("select 1", [])
+		_ = outer.transaction!(|db| db.execute_unchecked!("select nope from does_not_exist", []))
+		outer.execute_unchecked!("select 1", [])
 	})?
 	logged = log_since!(client, before)?
 	check("nested transactions through the body's client put no warning in the server log, it says:\n${logged}", !logged.contains("there is already a transaction in progress"))?
 	Stdout.line!("ok: nested transactions without server warnings")
 }
 
-log_size! = |client| client.query_one!("select (pg_stat_file('log')).size as n", [], |r| r.i64("n"))
+log_size! = |client| client.query_one_unchecked!("select (pg_stat_file('log')).size as n", [], |r| r.i64("n"))
 
-log_since! = |client, offset| client.query_one!("select pg_read_file('log', $1::int8, 1000000) as text", [Param.i64(offset)], |r| r.str("text"))
+log_since! = |client, offset| client.query_one_unchecked!("select pg_read_file('log', $1::int8, 1000000) as text", [Param.i64(offset)], |r| r.str("text"))
 
-nested_names! = |client| client.query!("select name from nested order by name", [], |row| row.str("name"))
+nested_names! = |client| client.query_unchecked!("select name from nested order by name", [], |row| row.str("name"))
 
-nested_count! = |client, table| client.query_one!("select count(*)::int as n from ${table}", [], |row| row.i32("n"))
+nested_count! = |client, table| client.query_one_unchecked!("select count(*)::int as n from ${table}", [], |row| row.i32("n"))
 
 ## execute! returns how many rows a statement affected, and zero for one
 ## that reports no count. The count comes from the command tag, which
 ## PgResult keeps.
 test_execute_counts! = |client| {
-	created = client.execute!("create temp table counted (n int)", [])?
+	created = client.execute_unchecked!("create temp table counted (n int)", [])?
 	check("execute! counts nothing for create table", created == 0)?
-	inserted = client.execute!("insert into counted select generate_series(1, 5)", [])?
+	inserted = client.execute_unchecked!("insert into counted select generate_series(1, 5)", [])?
 	check("execute! counts inserted rows", inserted == 5)?
-	updated = client.execute!("update counted set n = n * 10 where n > $1", [Param.i32(2)])?
+	updated = client.execute_unchecked!("update counted set n = n * 10 where n > $1", [Param.i32(2)])?
 	check("execute! counts updated rows", updated == 3)?
-	none = client.execute!("delete from counted where n < 0", [])?
+	none = client.execute_unchecked!("delete from counted where n < 0", [])?
 	check("execute! counts zero rows", none == 0)?
-	deleted = client.execute!("delete from counted where n >= $1", [Param.i32(30)])?
+	deleted = client.execute_unchecked!("delete from counted where n >= $1", [Param.i32(30)])?
 	check("execute! counts deleted rows", deleted == 3)?
-	result = client.command!(Statement.new("insert into counted values (1), (2) returning n"))?
+	result = client.command!(Statement.new_unchecked("insert into counted values (1), (2) returning n"))?
 	check("PgResult.command_tag", PgResult.command_tag(result) == "INSERT 0 2")?
 	check("PgResult.rows_affected", PgResult.rows_affected(result) == 2)?
-	_ = client.execute!("drop table counted", [])?
+	_ = client.execute_unchecked!("drop table counted", [])?
 	Stdout.line!("ok: execute counts")
 }
 
@@ -447,7 +447,7 @@ test_execute_counts! = |client| {
 ## in a string, a comment or a function body is safe. A failing statement
 ## rolls the whole batch back, and the connection stays usable after it.
 test_batch_execute! = |client| {
-	client.batch_execute!(
+	client.batch_execute_unchecked!(
 		Str.join_with(
 			[
 				"create temp table batched (n int, note text);",
@@ -459,22 +459,22 @@ test_batch_execute! = |client| {
 			"\n",
 		),
 	)?
-	notes = client.query!("select note from batched order by n", [], |row| row.str("note"))?
-	check("batch_execute! runs every statement, whatever holds a ;", notes == ["semi;colon", "dollar;quoted"])?
-	doubled = client.query_one!("select pg_temp.batched_double(21) as n", [], |row| row.i32("n"))?
-	check("batch_execute! creates a function whose body holds a ;", doubled == 42)?
+	notes = client.query_unchecked!("select note from batched order by n", [], |row| row.str("note"))?
+	check("batch_execute_unchecked! runs every statement, whatever holds a ;", notes == ["semi;colon", "dollar;quoted"])?
+	doubled = client.query_one_unchecked!("select pg_temp.batched_double(21) as n", [], |row| row.i32("n"))?
+	check("batch_execute_unchecked! creates a function whose body holds a ;", doubled == 42)?
 
-	match client.batch_execute!("insert into batched values (3, 'rolled back'); select 1 / 0; insert into batched values (4, 'never run')") {
+	match client.batch_execute_unchecked!("insert into batched values (3, 'rolled back'); select 1 / 0; insert into batched values (4, 'never run')") {
 		Ok({}) => Err(TestFailed("a batch with a failing statement should fail"))
-		Err(PgErr(error)) => check("batch_execute! reports the failing statement", error.code == "22012")
+		Err(PgErr(error)) => check("batch_execute_unchecked! reports the failing statement", error.code == "22012")
 		Err(other) => Err(other)
 	}?
-	after_error = client.query_one!("select count(*)::int as n from batched", [], |row| row.i32("n"))?
-	check("batch_execute! rolls the whole batch back after a failure", after_error == 2)?
-	check("batch_execute! leaves the session idle after a failure", client.sync_status!()? == Idle)?
+	after_error = client.query_one_unchecked!("select count(*)::int as n from batched", [], |row| row.i32("n"))?
+	check("batch_execute_unchecked! rolls the whole batch back after a failure", after_error == 2)?
+	check("batch_execute_unchecked! leaves the session idle after a failure", client.sync_status!()? == Idle)?
 
 	undone = client.transaction!(|db| {
-		db.batch_execute!("insert into batched values (5, 'undone'); insert into batched values (6, 'undone')")?
+		db.batch_execute_unchecked!("insert into batched values (5, 'undone'); insert into batched values (6, 'undone')")?
 		Err(UndoOnPurpose)
 	})
 	match undone {
@@ -482,17 +482,17 @@ test_batch_execute! = |client| {
 		Ok(_) => Err(TestFailed("the transaction body should fail"))
 		Err(other) => Err(other)
 	}?
-	after_undo = client.query_one!("select count(*)::int as n from batched", [], |row| row.i32("n"))?
-	check("batch_execute! inside transaction! rolls back with it", after_undo == 2)?
+	after_undo = client.query_one_unchecked!("select count(*)::int as n from batched", [], |row| row.i32("n"))?
+	check("batch_execute_unchecked! inside transaction! rolls back with it", after_undo == 2)?
 
-	client.batch_execute!("")?
-	match client.batch_execute!("select 1;\u(0)drop table batched") {
-		Err(ContainsNul(what)) => check("batch_execute! refuses a NUL byte", what == "sql")
+	client.batch_execute_unchecked!("")?
+	match client.batch_execute_unchecked!("select 1;\u(0)drop table batched") {
+		Err(ContainsNul(what)) => check("batch_execute_unchecked! refuses a NUL byte", what == "sql")
 		Ok({}) => Err(TestFailed("a batch with a NUL byte should be refused"))
 		Err(other) => Err(other)
 	}?
 
-	client.batch_execute!("drop table batched; drop function pg_temp.batched_double(int)")?
+	client.batch_execute_unchecked!("drop table batched; drop function pg_temp.batched_double(int)")?
 	Stdout.line!("ok: batch_execute")
 }
 
@@ -501,8 +501,8 @@ test_batch_execute! = |client| {
 ## passes on the throwaway server it boots (a `trust` server never sends a
 ## password challenge).
 test_password_auth! = |server, admin| {
-	_ = admin.command!(Statement.new("drop user if exists roc_pg_password_test"))?
-	_ = admin.command!(Statement.new("create user roc_pg_password_test password 'opensesame'"))?
+	_ = admin.command!(Statement.new_unchecked("drop user if exists roc_pg_password_test"))?
+	_ = admin.command!(Statement.new_unchecked("create user roc_pg_password_test password 'opensesame'"))?
 
 	authed = Client.connect!(
 		{
@@ -516,7 +516,7 @@ test_password_auth! = |server, admin| {
 			timeout_ms: 5000,
 		},
 	)?
-	result = authed.command!(Statement.new("select 1 as one"))?
+	result = authed.command!(Statement.new_unchecked("select 1 as one"))?
 	one = PgResult.decode_one(result, |r| r.i32("one"))?
 	check("query after password auth", one == 1)?
 	authed.close!()
@@ -564,22 +564,22 @@ test_password_auth! = |server, admin| {
 
 ## query_one! wants exactly one row, and the decoder's errors come through.
 test_query_one! = |client| {
-	one = client.query_one!("select 7 as n", [], |r| r.i32("n"))?
+	one = client.query_one_unchecked!("select 7 as n", [], |r| r.i32("n"))?
 	check("query_one! one row", one == 7)?
 
-	match client.query_one!("select 1 as n where false", [], |r| r.i32("n")) {
+	match client.query_one_unchecked!("select 1 as n where false", [], |r| r.i32("n")) {
 		Err(EmptyResult) => Ok({})
 		Ok(_) => Err(TestFailed("no rows should be EmptyResult"))
 		Err(other) => Err(other)
 	}?
 
-	match client.query_one!("select n from generate_series(1, 3) as t (n)", [], |r| r.i32("n")) {
+	match client.query_one_unchecked!("select n from generate_series(1, 3) as t (n)", [], |r| r.i32("n")) {
 		Err(MultipleRows(3)) => Ok({})
 		Ok(_) => Err(TestFailed("three rows should be MultipleRows"))
 		Err(other) => Err(other)
 	}?
 
-	match client.query_one!("select 'x' as n", [], |r| r.i32("n")) {
+	match client.query_one_unchecked!("select 'x' as n", [], |r| r.i32("n")) {
 		Err(InvalidNumStr("n")) => Ok({})
 		Ok(_) => Err(TestFailed("decoding 'x' as an int should fail"))
 		Err(other) => Err(other)
@@ -590,25 +590,25 @@ test_query_one! = |client| {
 ## query_optional! tells one row from none inside its result, refuses more
 ## than one, and passes decode and server errors through.
 test_query_optional! = |client| {
-	found = client.query_optional!("select 7 as n", [], |r| r.i32("n"))?
+	found = client.query_optional_unchecked!("select 7 as n", [], |r| r.i32("n"))?
 	check("query_optional! one row", found == Ok(7))?
 
-	none = client.query_optional!("select 1 as n where false", [], |r| r.i32("n"))?
+	none = client.query_optional_unchecked!("select 1 as n where false", [], |r| r.i32("n"))?
 	check("query_optional! no row", none == Err(NotFound))?
 
-	match client.query_optional!("select n from generate_series(1, 2) as t (n)", [], |r| r.i32("n")) {
+	match client.query_optional_unchecked!("select n from generate_series(1, 2) as t (n)", [], |r| r.i32("n")) {
 		Err(MultipleRows(2)) => Ok({})
 		Ok(_) => Err(TestFailed("two rows should be MultipleRows"))
 		Err(other) => Err(other)
 	}?
 
-	match client.query_optional!("select 'x' as n", [], |r| r.i32("n")) {
+	match client.query_optional_unchecked!("select 'x' as n", [], |r| r.i32("n")) {
 		Err(InvalidNumStr("n")) => Ok({})
 		Ok(_) => Err(TestFailed("decoding 'x' as an int should fail"))
 		Err(other) => Err(other)
 	}?
 
-	match client.query_optional!("select nope from does_not_exist", [], |r| r.i32("nope")) {
+	match client.query_optional_unchecked!("select nope from does_not_exist", [], |r| r.i32("nope")) {
 		Err(PgErr(error)) => check("query_optional! passes a server error through", error.code == "42P01")
 		Ok(_) => Err(TestFailed("a missing table should fail"))
 		Err(other) => Err(other)
@@ -620,8 +620,8 @@ test_query_optional! = |client| {
 ## infers the element type from the placeholder), and the list accessors
 ## decode the text form back, quoting and all.
 test_arrays! = |client| {
-	_ = client.execute!("create temp table tagged (id int, tags text[], nums int[])", [])?
-	_ = client.execute!(
+	_ = client.execute_unchecked!("create temp table tagged (id int, tags text[], nums int[])", [])?
+	_ = client.execute_unchecked!(
 		"insert into tagged (id, tags, nums) values ($1, $2, $3)",
 		[
 			Param.i32(1),
@@ -629,7 +629,7 @@ test_arrays! = |client| {
 			Param.list([Param.i32(1), Param.i32(-2)]),
 		],
 	)?
-	row = client.query_one!(
+	row = client.query_one_unchecked!(
 		"select tags, nums from tagged where id = $1",
 		[Param.i32(1)],
 		|r| Ok({ tags: r.str_list("tags")?, nums: r.i32_list("nums")? }),
@@ -638,12 +638,12 @@ test_arrays! = |client| {
 	check("int[] round trip", row.nums == [1, -2])?
 
 	# `= any($1)` is how a list of ids goes into a where clause.
-	matched = client.query!("select id from tagged where id = any($1)", [Param.list([Param.i32(1), Param.i32(5)])], |r| r.i32("id"))?
+	matched = client.query_unchecked!("select id from tagged where id = any($1)", [Param.list([Param.i32(1), Param.i32(5)])], |r| r.i32("id"))?
 	check("any(list) binding", matched == [1])?
 
 	# A NULL element, an empty array, and a nested list, which binds as a
 	# two-dimensional array but only decodes as text.
-	odd = client.query_one!(
+	odd = client.query_one_unchecked!(
 		"select array[1, null]::int[] as with_null, '{}'::int[] as empty, $1::int[][] as nested",
 		[Param.list([Param.list([Param.i32(1), Param.i32(2)]), Param.list([Param.i32(3), Param.i32(4)])])],
 		|r| {
@@ -671,15 +671,15 @@ test_arrays! = |client| {
 ## string, and an enum array is an array like any other. Enum types are
 ## not temporary, so the test drops its own.
 test_enums! = |client| {
-	_ = client.execute!("drop type if exists roc_pg_mood", [])?
-	_ = client.execute!("create type roc_pg_mood as enum ('sad', 'ok', 'happy')", [])?
-	_ = client.execute!("create temp table moods (id int, mood roc_pg_mood, history roc_pg_mood[])", [])?
-	_ = client.execute!(
+	_ = client.execute_unchecked!("drop type if exists roc_pg_mood", [])?
+	_ = client.execute_unchecked!("create type roc_pg_mood as enum ('sad', 'ok', 'happy')", [])?
+	_ = client.execute_unchecked!("create temp table moods (id int, mood roc_pg_mood, history roc_pg_mood[])", [])?
+	_ = client.execute_unchecked!(
 		"insert into moods values ($1, $2, $3)",
 		[Param.i32(1), Param.str("happy"), Param.list([Param.str("sad"), Param.str("ok")])],
 	)?
 
-	row = client.query_one!(
+	row = client.query_one_unchecked!(
 		"select mood, history from moods where mood = $1",
 		[Param.str("happy")],
 		|r| Ok({ mood: r.str("mood")?, history: r.str_list("history")? }),
@@ -687,18 +687,18 @@ test_enums! = |client| {
 	check("enum in and out", row.mood == "happy")?
 	check("enum array in and out", row.history == ["sad", "ok"])?
 
-	matched = client.query!("select id from moods where mood = any($1)", [Param.list([Param.str("happy"), Param.str("sad")])], |r| r.i32("id"))?
+	matched = client.query_unchecked!("select id from moods where mood = any($1)", [Param.list([Param.str("happy"), Param.str("sad")])], |r| r.i32("id"))?
 	check("enum any(list)", matched == [1])?
 
-	match client.execute!("insert into moods values ($1, $2, $3)", [Param.i32(2), Param.str("angry"), Param.list([])]) {
+	match client.execute_unchecked!("insert into moods values ($1, $2, $3)", [Param.i32(2), Param.str("angry"), Param.list([])]) {
 		Ok(_) => Err(TestFailed("a label outside the enum should fail"))
 		# 22P02 is invalid_text_representation
 		Err(PgErr(error)) => check("bad enum label is a server error", error.code == "22P02")
 		Err(other) => Err(other)
 	}?
 
-	_ = client.execute!("drop table moods", [])?
-	_ = client.execute!("drop type roc_pg_mood", [])?
+	_ = client.execute_unchecked!("drop table moods", [])?
+	_ = client.execute_unchecked!("drop type roc_pg_mood", [])?
 	Stdout.line!("ok: enums")
 }
 
@@ -706,14 +706,14 @@ test_enums! = |client| {
 ## leaves out is refused. ./tests.roc prepends the pg_hba rules that make the
 ## server ask these users for md5 and for SCRAM.
 test_md5_and_scram! = |server, admin| {
-	_ = admin.command!(Statement.new("drop user if exists roc_pg_md5_test"))?
-	_ = admin.command!(Statement.new("drop user if exists roc_pg_scram_test"))?
+	_ = admin.command!(Statement.new_unchecked("drop user if exists roc_pg_md5_test"))?
+	_ = admin.command!(Statement.new_unchecked("drop user if exists roc_pg_scram_test"))?
 	# How a password is stored decides what the server can check it with: an
 	# md5 hash only with md5.
-	_ = admin.command!(Statement.new("set password_encryption = 'md5'"))?
-	_ = admin.command!(Statement.new("create user roc_pg_md5_test password 'md5-secret'"))?
-	_ = admin.command!(Statement.new("set password_encryption = 'scram-sha-256'"))?
-	_ = admin.command!(Statement.new("create user roc_pg_scram_test password 'scram-secret'"))?
+	_ = admin.command!(Statement.new_unchecked("set password_encryption = 'md5'"))?
+	_ = admin.command!(Statement.new_unchecked("create user roc_pg_md5_test password 'md5-secret'"))?
+	_ = admin.command!(Statement.new_unchecked("set password_encryption = 'scram-sha-256'"))?
+	_ = admin.command!(Statement.new_unchecked("create user roc_pg_scram_test password 'scram-secret'"))?
 
 	all = [Scram, Md5, Cleartext, Trust]
 	md5 = { user: "roc_pg_md5_test", password: "md5-secret" }
@@ -758,13 +758,13 @@ test_scram_passwords! = |server, admin| {
 		{ user: "roc_pg_scram_low_test", password: "scram-secret", iterations: 1000 },
 		{ user: "roc_pg_scram_high_test", password: "scram-secret", iterations: 1_000_001 },
 	]
-	_ = admin.command!(Statement.new("set password_encryption = 'scram-sha-256'"))?
+	_ = admin.command!(Statement.new_unchecked("set password_encryption = 'scram-sha-256'"))?
 	for stored in users {
-		_ = admin.command!(Statement.new("drop user if exists ${stored.user}"))?
-		_ = admin.command!(Statement.new("set scram_iterations = ${stored.iterations.to_str()}"))?
-		_ = admin.command!(Statement.new("create user ${stored.user} password '${stored.password}'"))?
+		_ = admin.command!(Statement.new_unchecked("drop user if exists ${stored.user}"))?
+		_ = admin.command!(Statement.new_unchecked("set scram_iterations = ${stored.iterations.to_str()}"))?
+		_ = admin.command!(Statement.new_unchecked("create user ${stored.user} password '${stored.password}'"))?
 	}
-	_ = admin.command!(Statement.new("reset scram_iterations"))?
+	_ = admin.command!(Statement.new_unchecked("reset scram_iterations"))?
 
 	login!(server, { user: "roc_pg_scram_utf8_test", password: "pässword with spaces" }, [Scram])?
 
@@ -783,7 +783,7 @@ test_scram_passwords! = |server, admin| {
 ## query.
 login! = |server, { user, password }, auth_methods| {
 	client = Client.connect!({ connect!: Tcp.connect!, random_u64!: Random.seed_u64!, host: server.host, port: server.port, user, database: server.database, auth: Password(password), timeout_ms: 5000, auth_methods })?
-	one = client.query_one!("select 1 as one", [], |r| r.i32("one"))
+	one = client.query_one_unchecked!("select 1 as one", [], |r| r.i32("one"))
 	client.close!()
 	check("a query after logging in as ${user}", one? == 1)
 }
@@ -813,12 +813,12 @@ scram_refused = |outcome, reason|
 ## that demands TLS is refused.
 test_connect_url! = |server| {
 	base = "postgresql://roc_pg_scram_test:scram-secret@${server.host}:${server.port.to_str()}/${server.database}"
-	options = "application_name=roc-pg-url&options=-c%20statement_timeout%3D4321"
+	options = "application_name=roc-pg-insane-in-the-membrane-url&options=-c%20statement_timeout%3D4321"
 	client = Client.connect_url!("${base}?sslmode=disable&${options}", { connect!: Tcp.connect!, random_u64!: Random.seed_u64! })?
-	application_name = client.query_one!("select current_setting('application_name') as name", [], |r| r.str("name"))
-	timeout = client.query_one!("select current_setting('statement_timeout') as t", [], |r| r.str("t"))
+	application_name = client.query_one_unchecked!("select current_setting('application_name') as name", [], |r| r.str("name"))
+	timeout = client.query_one_unchecked!("select current_setting('statement_timeout') as t", [], |r| r.str("t"))
 	client.close!()
-	check("the URL's application_name reaches the session", application_name? == "roc-pg-url")?
+	check("the URL's application_name reaches the session", application_name? == "roc-pg-insane-in-the-membrane-url")?
 	check("the URL's -c statement_timeout reaches the session", timeout? == "4321ms")?
 	match Client.connect_url!("${base}?sslmode=require", { connect!: Tcp.connect!, random_u64!: Random.seed_u64! }) {
 		Err(InvalidConnectionUrl(UnsupportedSslMode("require"))) => Ok({})
@@ -837,11 +837,11 @@ test_nul_bytes! = |server, client| {
 			Err(ContainsNul(given)) => check("a NUL byte in ${what} is ContainsNul(${what}), not ContainsNul(${given})", given == what)
 			other => Err(TestFailed("a NUL byte in ${what} was not refused: ${Str.inspect(other)}"))
 		}
-	nul(client.query!("select 1\u(0)drop table nested", [], |r| r.i32("one")), "sql")?
-	nul(client.execute!("select 1\u(0)", []), "sql")?
-	nul(client.prepare!("select 1\u(0)", { name: "nul" }), "sql")?
-	nul(client.prepare!("select 1", { name: "nul\u(0)" }), "statement name")?
-	after = client.query_one!("select 4 as four", [], |r| r.i32("four"))?
+	nul(client.query_unchecked!("select 1\u(0)drop table nested", [], |r| r.i32("one")), "sql")?
+	nul(client.execute_unchecked!("select 1\u(0)", []), "sql")?
+	nul(client.prepare_unchecked!("select 1\u(0)", { name: "nul" }), "sql")?
+	nul(client.prepare_unchecked!("select 1", { name: "nul\u(0)" }), "statement name")?
+	after = client.query_one_unchecked!("select 4 as four", [], |r| r.i32("four"))?
 	check("the client works after a refused NUL byte", after == 4)?
 
 	connect! = |settings| Client.connect!({ connect!: Tcp.connect!, random_u64!: Random.seed_u64!, host: server.host, port: server.port, user: settings.user, database: settings.database, auth: settings.auth, params: settings.params, timeout_ms: 5000 })
@@ -864,7 +864,7 @@ test_nul_bytes! = |server, client| {
 test_fatal_error! = |server| {
 	client = Client.connect!({ connect!: Tcp.connect!, random_u64!: Random.seed_u64!, host: server.host, port: server.port, user: server.user, database: server.database, auth: NoAuth, timeout_ms: 5000 })?
 	# 57P01 is admin_shutdown, what a terminated session is told.
-	match client.execute!("select pg_terminate_backend(pg_backend_pid())", []) {
+	match client.execute_unchecked!("select pg_terminate_backend(pg_backend_pid())", []) {
 		Err(PgErr(error)) => check("a terminated session is PgErr 57P01 FATAL, got ${error.code} ${error.severity}", error.code == "57P01" and error.severity == "FATAL")
 		other => Err(TestFailed("a terminated session was not a FATAL PgErr: ${Str.inspect(other)}"))
 	}?
@@ -875,13 +875,13 @@ test_fatal_error! = |server| {
 ## that only fails at commit) is TransactionCommitRefused, with the server's
 ## error, and nothing of the transaction lands.
 test_commit_refused! = |client| {
-	_ = client.execute!("create temp table deferred_in_transaction (i int unique deferrable initially deferred)", [])?
-	outcome = client.transaction!(|db| db.execute!("insert into deferred_in_transaction values (1), (1)", []))
+	_ = client.execute_unchecked!("create temp table deferred_in_transaction (i int unique deferrable initially deferred)", [])?
+	outcome = client.transaction!(|db| db.execute_unchecked!("insert into deferred_in_transaction values (1), (1)", []))
 	match outcome {
 		Err(TransactionCommitRefused(error)) => check("a refused commit keeps the server's SQLSTATE, got ${error.code}", error.code == "23505")
 		other => Err(TestFailed("a deferred violation inside transaction! was not TransactionCommitRefused: ${Str.inspect(other)}"))
 	}?
-	count = client.query_one!("select count(*)::int as n from deferred_in_transaction", [], |r| r.i32("n"))?
+	count = client.query_one_unchecked!("select count(*)::int as n from deferred_in_transaction", [], |r| r.i32("n"))?
 	check("a refused commit lands nothing", count == 0)?
 	check("a refused commit leaves the session idle", client.sync_status!()? == Idle)?
 	Stdout.line!("ok: commit refused inside transaction!")
@@ -892,11 +892,11 @@ test_commit_refused! = |client| {
 test_statement_timeout! = |server| {
 	client = Client.connect!({ connect!: Tcp.connect!, random_u64!: Random.seed_u64!, host: server.host, port: server.port, user: server.user, database: server.database, auth: NoAuth, statement_timeout_ms: 100 })?
 	# 57014 is query_canceled.
-	match client.execute!("select pg_sleep(2)", []) {
+	match client.execute_unchecked!("select pg_sleep(2)", []) {
 		Err(PgErr(error)) => check("a statement past statement_timeout_ms is 57014, got ${error.code}", error.code == "57014")
 		other => Err(TestFailed("a statement past statement_timeout_ms was not cancelled: ${Str.inspect(other)}"))
 	}?
-	after = client.query_one!("select 5 as five", [], |r| r.i32("five"))?
+	after = client.query_one_unchecked!("select 5 as five", [], |r| r.i32("five"))?
 	check("the connection works after a cancelled statement", after == 5)?
 	client.close!()
 	Stdout.line!("ok: statement timeout")
@@ -905,10 +905,10 @@ test_statement_timeout! = |server| {
 ## A statement prepared on one connection runs on another too, where its
 ## name does not exist: the client parses its SQL again there.
 test_prepared_elsewhere! = |server, client| {
-	add = client.prepare!("select $1::int + $2::int as sum", { name: "add_elsewhere" })?
+	add = client.prepare_unchecked!("select $1::int + $2::int as sum", { name: "add_elsewhere" })?
 	other = Client.connect!({ connect!: Tcp.connect!, random_u64!: Random.seed_u64!, host: server.host, port: server.port, user: server.user, database: server.database, auth: NoAuth, timeout_ms: 5000 })?
 	elsewhere = other.command!(add.bind([Param.i32(40), Param.i32(2)]))
-	names = other.query!("select name from pg_prepared_statements", [], |r| r.str("name"))
+	names = other.query_unchecked!("select name from pg_prepared_statements", [], |r| r.str("name"))
 	other.close!()
 	sum = PgResult.decode_one(elsewhere?, |r| r.i32("sum"))?
 	check("a statement prepared on another connection runs here", sum == 42)?

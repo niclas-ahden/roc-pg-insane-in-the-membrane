@@ -1,6 +1,7 @@
 #!/usr/bin/env roc
 ## All tests: the package's `expect` blocks, a syntax check of the examples,
-## then the integration tests against a throwaway Postgres server.
+## the checked queries that must not compile, then the integration tests
+## against a throwaway Postgres server.
 ##
 ## The server binaries (initdb, pg_ctl) come from the flake dev shell:
 ##
@@ -27,9 +28,12 @@ main! = |_args| {
 	run!("roc", ["test", "package/main.roc"])?
 
 	Stdout.line!("== check examples and tests")?
-	for file in ["examples/query.roc", "examples/prepared.roc", "examples/webserver.roc", "tests/integration.roc", "tests/concurrent/server.roc"] {
+	for file in ["examples/query.roc", "examples/prepared.roc", "examples/webserver.roc", "examples/small/main.roc", "examples/rebellion/main.roc", "tests/integration.roc", "tests/typed.roc", "tests/concurrent/server.roc"] {
 		check!(file)?
 	}
+
+	Stdout.line!("== queries that must not compile")?
+	compile_errors!({})?
 
 	Stdout.line!("== integration tests against a throwaway Postgres")?
 	# The data dir is repo local (and gitignored) rather than under TMPDIR,
@@ -61,7 +65,11 @@ main! = |_args| {
 	# (/run/postgresql) is not writable in CI or the nix dev shell.
 	run!("pg_ctl", ["start", "-D", data, "-l", "${data}/log", "-w", "-o", "-p ${pg_port} -c listen_addresses=127.0.0.1 -k ${data}"])?
 
-	result = run!("roc", ["tests/integration.roc", "127.0.0.1", pg_port, pg_user, pg_database])
+	result =
+		match run!("roc", ["tests/integration.roc", "127.0.0.1", pg_port, pg_user, pg_database]) {
+			Ok({}) => run!("roc", ["tests/typed.roc", "127.0.0.1", pg_port, pg_user, pg_database])
+			Err(err) => Err(err)
+		}
 
 	concurrent_result =
 		match result {
@@ -221,3 +229,65 @@ collect_pids! = |index, pids|
 			Err(ConcurrentTestFailed("request ${index.to_str()} got: ${reply}"))
 		}
 	}
+
+# ---- checked queries that must fail to compile ----
+
+## Each query of tests/checked_sql_errors.roc that `roc build` must reject,
+## and the message it should give.
+expected_errors = [
+	{ query: "unknown_table!", message: "table `student` does not exist in the schema (did you mean `students`?)" },
+	{ query: "unknown_column!", message: "column `r.schol_id` does not exist in `students` (did you mean `school_id`?)" },
+	{ query: "positional!", message: "use `$name` placeholders named after the fields of the parameter record," },
+	{ query: "unterminated!", message: "unterminated string constant at line 1, column 38" },
+	{ query: "ambiguous!", message: "column `id` is ambiguous: it is in `r` and `o`" },
+	{ query: "bad_insert_column!", message: "column `nmae` does not exist in `students` (did you mean `name`?)" },
+	{ query: "misspelled_param!", message: "`$schol_id` is not a field of the parameter record (did you mean `school_id`?)" },
+	{ query: "unused_param!", message: "the parameter record has a field `name`, but the query has no `$name`" },
+	{ query: "param_type!", message: "column `school_id` is `integer`, but `$school_id` is `Dec`" },
+	{ query: "null_param!", message: "column `name` is NOT NULL, but `$name` is `Try(Str, [Null])`" },
+	{ query: "syntax_error!", message: "syntax error at or near \"students\" (line 1, column 16)" },
+	{ query: "two_statements!", message: "cannot insert multiple commands into a prepared statement" },
+	{ query: "untyped_db!", message: "`$idd` is not a field of the parameter record (did you mean `id`?)" },
+	{ query: "missing_field!", message: "the row has a field `phone`, but the query returns no column by that name (it returns `id`)" },
+	{ query: "misspelled_field!", message: "the row has a field `nmae`, but the query returns no column by that name (it returns `id`, `name`) (did you mean `name`?)" },
+	{ query: "nullable_field!", message: "column `phone` can be NULL, so its field needs to be `Try(Str, [Null])`" },
+	{ query: "nullif_field!", message: "column `school_id` can be NULL, so its field needs to be `Try(I32, [Null])`" },
+	{ query: "count_field!", message: "column `n` is `bigint`, but its field is `I32`" },
+	{ query: "sum_field!", message: "column `total` is `bigint`, but its field is `I32`" },
+	{ query: "nested_field!", message: "a field of the row type is a record, which a result row cannot fill" },
+	{ query: "inferred_row!", message: "the row has a field `name`, but the query returns no column by that name (it returns `id`)" },
+]
+
+## `roc check` runs every `from_quote`, so it rejects the same queries a
+## build does.
+compile_errors! : {} => Try({}, _)
+compile_errors! = |{}| {
+	outcome = Cmd.new_str("roc").args_str(["check", "tests/checked_sql_errors.roc"]).exec_output!()
+	output =
+		match outcome {
+			Ok(_) => return Err(CompileErrorsCompiled)
+			Err(NonZeroExitCode({ stdout_utf8_lossy, stderr_utf8_lossy, exit_code: _, command: _ })) => "${stdout_utf8_lossy}${stderr_utf8_lossy}"
+			Err(_) => return Err(CompileErrorsDidNotRun)
+		}
+	# Every query must be rejected, each at its literal with its own
+	# message, and nothing else. Long messages wrap onto indented lines.
+	blocks = output.split_on("── ✗ invalid string").drop_first(1)
+	for { query, message } in expected_errors {
+		match blocks.find_first(|block| block.contains("\n${query} = ")) {
+			Ok(block) =>
+				if !Str.join_with(block.split_on("\n").map(|line| line.trim()), " ").contains(message) {
+					Stdout.line!(output)?
+					return Err(WrongMessage(query))
+				}
+			Err(_) => {
+				Stdout.line!(output)?
+				return Err(NotRejected(query))
+			}
+		}
+	}
+	if blocks.len() != expected_errors.len() {
+		Stdout.line!(output)?
+		return Err(WrongCompileErrorCount({ expected: expected_errors.len(), got: blocks.len() }))
+	}
+	Stdout.line!("ok: ${expected_errors.len().to_str()} queries rejected at compile time, each with its message")
+}

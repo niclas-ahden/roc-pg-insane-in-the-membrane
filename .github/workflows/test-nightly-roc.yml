@@ -30,7 +30,7 @@ jobs:
     uses: niclas-ahden/roc-workflows/.github/workflows/suite.yml@v3
     with:
       roc: ${{ needs.roc-versions.outputs.nightly }}
-      label: roc-pg ${{ needs.roc-versions.outputs.release }} on ${{ needs.roc-versions.outputs.nightly }}
+      label: roc-pg-insane-in-the-membrane ${{ needs.roc-versions.outputs.release }} on ${{ needs.roc-versions.outputs.nightly }}
       examples: ''
       setup: .github/scripts/suite-setup.sh
       ref: ${{ needs.roc-versions.outputs.release }}
@@ -42,7 +42,7 @@ jobs:
     uses: niclas-ahden/roc-workflows/.github/workflows/suite.yml@v3
     with:
       roc: ${{ needs.roc-versions.outputs.nightly }}
-      label: roc-pg ${{ needs.roc-versions.outputs.release }} on ${{ needs.roc-versions.outputs.nightly }}
+      label: roc-pg-insane-in-the-membrane ${{ needs.roc-versions.outputs.release }} on ${{ needs.roc-versions.outputs.nightly }}
       examples: ''
       setup: .github/scripts/suite-setup.sh
       opts: '["dev", "size", "interpreter"]'
@@ -66,5 +66,5 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - run: |
-          echo "::error::roc-pg ${{ needs.roc-versions.outputs.release }} fails on roc ${{ needs.roc-versions.outputs.nightly }}"
+          echo "::error::roc-pg-insane-in-the-membrane ${{ needs.roc-versions.outputs.release }} fails on roc ${{ needs.roc-versions.outputs.nightly }}"
           echo "  https://github.com/roc-lang/roc/compare/${{ needs.roc-versions.outputs.prev_sha }}...${{ needs.roc-versions.outputs.sha }}"

@@ -1,13 +1,15 @@
-## A Postgres client connection.
+## A connection to a Postgres server.
 ##
-## Connect with [Client.connect!], handing it the platform's `connect!` and
-## its source of random numbers, which a SCRAM login needs. Everything else
-## goes through two methods of the stream `connect!` returns, `write!` and
+## Open one with `Client.connect!`, passing the platform's `connect!` and its
+## random numbers, which a SCRAM login needs. Everything after that goes
+## through two methods of the stream `connect!` returns, `write!` and
 ## `read_exactly!`, each taking a timeout in milliseconds, as `Tcp.Stream`
 ## does on [basic-cli](https://github.com/roc-lang/basic-cli):
 ##
 ## ```
-## client = Client.connect!({
+## Db : Client.Client(Tcp.Stream, Schema)
+##
+## db = Client.connect!({
 ##     connect!: Tcp.connect!,
 ##     random_u64!: Random.seed_u64!,
 ##     host: "localhost",
@@ -16,11 +18,18 @@
 ##     database: "postgres",
 ##     auth: Password(password),
 ## })?
-## one = client.query_one!("select 1 as one", [], |row| row.i32("one"))?
+##
+## names : List({ name : Str })
+## names = db.query!("select name from users where team_id = $team_id", { team_id, })?
 ## ```
 ##
 ## On [basic-webserver](https://github.com/roc-lang/basic-webserver), whose
-## streams take no timeout, wrap its `connect!` in [Client.fixed_timeout].
+## streams take no timeout, wrap its `connect!` in `Client.fixed_timeout`.
+## The client is then a
+## `Client.Client(Client.FixedTimeout(Tcp.Stream), Schema)`.
+##
+## `Schema` is the schema your queries are checked against (see [Catalog]),
+## or [NoSchema] if you have none.
 ##
 ## The connection is plaintext for now, because neither
 ## [roc-lang/basic-cli](https://github.com/roc-lang/basic-cli) nor
@@ -29,41 +38,42 @@
 ## platform does. To reach a database on another machine until then, you
 ## can connect to a TLS proxy on this one, such as a
 ## [PgBouncer](https://www.pgbouncer.org) that talks TLS to the database.
+## `timeout_ms` limits each connect, read and write, not a whole query. See
+## `Client.connect!` for the timeouts and for how the client logs in.
 ##
-## `timeout_ms` caps each TCP dial, read, and write (not a whole command).
-## Zero is not "no timeout": the platform fails a zero timeout immediately.
-## See [Client.connect!] for its default and for `statement_timeout_ms`.
+## The functions take the client first, so you call them as methods:
 ##
-## A client is one connection, and a connection carries one conversation at a
-## time. Never share a client between code that runs at the same time, like
-## the handlers of a web server: their messages would interleave, and each
-## could read the other's reply. Connect in each request instead. We
-## recommend a [PgBouncer](https://www.pgbouncer.org) on the same machine
-## for that, since it keeps the connections to the database open, which
-## makes connecting cheap.
+## - `Client.query!`, `Client.query_one!`, `Client.query_optional!` and
+##   `Client.execute!` run queries that are checked when you build.
+## - `Client.transaction!` runs several statements as one transaction.
+## - `Client.query_unchecked!` and the other `_unchecked` functions run SQL
+##   you build at runtime.
+## - `Client.batch_execute_unchecked!` runs several statements separated by
+##   `;`, such as a migration.
+## - `Client.prepare_unchecked!` and `Client.command!` run prepared statements.
+## - `Client.close!` ends the session.
 ##
-## A client is a nominal record `Client(stream)`, parameterized by the
-## platform's stream type, since this package never names platform types.
-## Its functions take the client first, so they read as methods:
-## `client.query!(sql, params, decode_row)`, `client.execute!(sql, params)`,
-## `client.batch_execute!(sql)`, `client.transaction!(|db| ...)`,
-## `client.command!(stmt)`,
-## `client.prepare!(sql, { name })`, `client.close!()`. In an app signature
-## the client is `Client.Client(Tcp.Stream)`, or
-## `Client.Client(Client.FixedTimeout(Tcp.Stream))` through
-## [Client.fixed_timeout].
+## A client is one connection, and runs one query at a time. Never share
+## one between code that runs at the same time, such as the handlers of a
+## web server: their messages would interleave, and each could read the
+## other's reply. Connect in each request instead. We recommend a
+## [PgBouncer](https://www.pgbouncer.org) on the same machine for that,
+## since it keeps the connections to the database open, which makes
+## connecting cheap.
 ##
-## Errors: every function names its error union (see [Client.CommandErr]).
-## A server error (`PgErr`) leaves the connection usable, the client drains
-## the conversation for you, unless its severity is `FATAL` or `PANIC`: the
-## server closes the connection after those. After a transport or protocol
-## error (`PgReadErr`, `PgWriteErr`, `PgProtoErr`) the connection state is
-## unknown, so don't reuse the client. The platform closes its stream once
-## nothing refers to it anymore. The platform's own error is the payload of
-## `PgReadErr`, `PgWriteErr` and `PgConnectErr`. Wrapping it there, instead
-## of passing the platform's union through, keeps each call's error union
-## independent, so a bare `?` and a `? Tag` on the same client can share a
-## function.
+## Every function names its errors with a type alias, such as
+## [Client.CommandErr]. They are open tag unions, so `?` merges them into
+## your own.
+##
+## - `PgErr(error)` means the server rejected the statement. The connection
+##   can still be used, unless `error.severity` is `FATAL` or `PANIC`: the
+##   server closes the connection after those.
+## - `ContainsNul(what)` means the SQL, a statement name or a connection
+##   setting holds a NUL byte, which the protocol cannot carry. Nothing was
+##   sent.
+## - `PgReadErr`, `PgWriteErr` and `PgProtoErr` mean the connection broke or
+##   is in an unknown state. Don't use the client again, connect anew. The
+##   platform closes the stream once nothing refers to it anymore.
 import Bytes
 import ConnectionUrl
 import Prepared
@@ -73,8 +83,14 @@ import Statement
 import Param
 import scram.Scram
 import PgResult
+import Sql
+import Check
+import ParamFormat
+import RowFormat
 
-Client(stream) :: {
+## `schema` is the schema checked queries are checked against (see
+## [Catalog]), or [NoSchema].
+Client(stream, schema) :: {
 	stream : stream,
 	timeout_ms : U64,
 	backend_key : [Known(ProtoBackend.KeyData), Pending],
@@ -222,7 +238,7 @@ Client(stream) :: {
 	## server sends nothing while one runs. By default 5 seconds more than
 	## `statement_timeout_ms`, or 60 seconds without one. A job with longer
 	## statements passes its own.
-	connect! : { connect! : Str, U16, U64 => Try(_, _), random_u64! : () => Try(U64, _), host : Str, port : U16, user : Str, database : Str, auth : [NoAuth, Password(Str)], timeout_ms ?: U64, statement_timeout_ms ?: U64, params ?: List((Str, Str)), auth_methods ?: List([Scram, Md5, Cleartext, Trust]) } => Try(Client(_), Client.ConnectErr(_, _, _, others))
+	connect! : { connect! : Str, U16, U64 => Try(_, _), random_u64! : () => Try(U64, _), host : Str, port : U16, user : Str, database : Str, auth : [NoAuth, Password(Str)], timeout_ms ?: U64, statement_timeout_ms ?: U64, params ?: List((Str, Str)), auth_methods ?: List([Scram, Md5, Cleartext, Trust]) } => Try(Client(_, _), Client.ConnectErr(_, _, _, others))
 	connect! = |{ connect!: dial!, random_u64!, host, port, user, database, auth, timeout_ms: given_timeout_ms, statement_timeout_ms, params, auth_methods }| {
 		statement_ms = statement_timeout_ms ?? 0
 		timeout_ms = given_timeout_ms ?? default_timeout_ms(statement_ms)
@@ -263,7 +279,7 @@ Client(stream) :: {
 	## ```
 	## client = Client.connect_url!(url, { connect!: Tcp.connect!, random_u64!: Random.seed_u64!, statement_timeout_ms: 30_000 })?
 	## ```
-	connect_url! : Str, { connect! : Str, U16, U64 => Try(_, _), random_u64! : () => Try(U64, _), timeout_ms ?: U64, statement_timeout_ms ?: U64, auth_methods ?: List([Scram, Md5, Cleartext, Trust]) } => Try(Client(_), Client.ConnectErr(_, _, _, [InvalidConnectionUrl(ConnectionUrl.ParseErr), ..others]))
+	connect_url! : Str, { connect! : Str, U16, U64 => Try(_, _), random_u64! : () => Try(U64, _), timeout_ms ?: U64, statement_timeout_ms ?: U64, auth_methods ?: List([Scram, Md5, Cleartext, Trust]) } => Try(Client(_, _), Client.ConnectErr(_, _, _, [InvalidConnectionUrl(ConnectionUrl.ParseErr), ..others]))
 	connect_url! = |url, { connect!: dial!, random_u64!, timeout_ms, statement_timeout_ms, auth_methods }| {
 		settings = ConnectionUrl.parse(url) ? |err| InvalidConnectionUrl(err)
 		statement_ms = statement_timeout_ms ?? 0
@@ -307,72 +323,32 @@ Client(stream) :: {
 				Err(err) => Err(err)
 			}
 
-	## Run a [Statement] and return its [PgResult]. [Client.query!],
-	## [Client.query_one!], [Client.query_optional!] and [Client.execute!] cover
-	## the common cases.
+	## Run a [Statement] and return its [PgResult]. The checked [Client.query!]
+	## and the `_unchecked` functions cover the common cases.
 	##
 	## The wire conversation is: Parse, Bind, Describe, Execute, Sync, then
 	## read messages until ReadyForQuery.
-	command! : Client(_), Statement.Statement => Try(PgResult.PgResult, Client.CommandErr(_, _, others))
-	command! = |client, stmt| {
-		{ format_codes, param_values } = Param.encode(stmt.params)
+	command! : Client(_, _), Statement.Statement => Try(PgResult.PgResult, Client.CommandErr(_, _, others))
+	command! = |client, stmt| Ok(run_statement!(client, stmt)?.result)
 
-		# A named prepared statement only exists on the connection it was
-		# prepared on. When this statement was prepared on a DIFFERENT
-		# connection, fall back to re-parsing its SQL as an unnamed
-		# statement, which is correct on any connection, at the cost of one
-		# extra Parse.
-		plan =
-			match stmt.kind {
-				Sql(sql) => {
-					check_no_nul(sql, "sql")?
-					UnnamedFlow(sql)
-				}
-				Prepared(prepared) =>
-					match (client.backend_key, prepared.prepared_on()) {
-						# Backend keys are only unique within one server, so
-						# statements prepared against a different host could
-						# in principle collide.
-						(Known(current), Known(origin)) if current.process_id == origin.process_id and current.secret_key == origin.secret_key => PreparedFlow(prepared)
-						_ => UnnamedFlow(prepared.sql())
-					}
-			}
-
-		messages =
-			match plan {
-				UnnamedFlow(sql) => unnamed_messages(sql, format_codes, param_values)
-				PreparedFlow(prepared) =>
-					[
-						ProtoFrontend.bind({ prepared_statement: prepared.name(), format_codes: format_codes, param_values: param_values }),
-						ProtoFrontend.execute,
-						ProtoFrontend.sync,
-					]
-				}
-
-		init_columns =
-			match plan {
-				UnnamedFlow(_) => []
-				PreparedFlow(prepared) => prepared.columns()
-			}
-
-		write_all!(client, Bytes.sequence(messages))?
-		read_reply!(client, init_columns)
-	}
-
-	## Run `sql` with `params` and decode every row by column name with
+	## Run SQL built at runtime with `params` for its `$1`, `$2`, ...
+	## placeholders, and decode every row by column name with
 	## `decode_row` (see [PgResult.decode]). The decoder's errors join the
 	## command's in the result.
 	##
 	## ```
-	## people = client.query!(
+	## people = client.query_unchecked!(
 	##     "select name, age from people where age > $1",
 	##     [Param.u8(18)],
 	##     |row| Ok({ name: row.str("name")?, age: row.u8("age")? }),
 	## )?
 	## ```
-	query! : Client(_), Str, List(Param.Param), (PgResult.Row -> Try(a, Client.CommandErr(_, _, others))) => Try(List(a), Client.CommandErr(_, _, others))
-	query! = |client, sql, params, decode_row|
-		PgResult.decode(client.command!(Statement.new(sql).bind(params))?, decode_row)
+	##
+	## Prefer [Client.query!] when the SQL is known when you write the code.
+	## It is checked when you build.
+	query_unchecked! : Client(_, _), Str, List(Param.Param), (PgResult.Row -> Try(a, Client.CommandErr(_, _, others))) => Try(List(a), Client.CommandErr(_, _, others))
+	query_unchecked! = |client, sql, params, decode_row|
+		PgResult.decode(client.command!(Statement.new_unchecked(sql).bind(params))?, decode_row)
 
 	## Run `sql` with `params` and decode the one row it returns. `EmptyResult`
 	## when there is none, and `MultipleRows(n)` when there are more: a query
@@ -380,29 +356,29 @@ Client(stream) :: {
 	## not a row to pick.
 	##
 	## ```
-	## id = client.query_one!("insert into people (name) values ($1) returning id", [Param.str(name)], |row| row.i32("id"))?
+	## id = client.query_one_unchecked!("insert into people (name) values ($1) returning id", [Param.str(name)], |row| row.i32("id"))?
 	## ```
-	query_one! : Client(_), Str, List(Param.Param), (PgResult.Row -> Try(a, Client.QueryOneErr(_, _, others))) => Try(a, Client.QueryOneErr(_, _, others))
-	query_one! = |client, sql, params, decode_row| {
-		result = client.command!(Statement.new(sql).bind(params))?
+	query_one_unchecked! : Client(_, _), Str, List(Param.Param), (PgResult.Row -> Try(a, Client.QueryOneErr(_, _, others))) => Try(a, Client.QueryOneErr(_, _, others))
+	query_one_unchecked! = |client, sql, params, decode_row| {
+		result = client.command!(Statement.new_unchecked(sql).bind(params))?
 		PgResult.decode_one(result, decode_row)
 	}
 
 	## Run `sql` with `params` and decode the row it returns, if any: `Ok(row)`
 	## for one row and `Err(NotFound)` for none, both inside the command's own
 	## `Ok`. More than one row fails with `MultipleRows(n)`, like
-	## [Client.query_one!].
+	## [Client.query_one_unchecked!].
 	##
 	## ```
-	## found = client.query_optional!("select name from people where email = $1", [Param.str(email)], |row| row.str("name"))?
+	## found = client.query_optional_unchecked!("select name from people where email = $1", [Param.str(email)], |row| row.str("name"))?
 	## match found {
 	##     Ok(name) => greet(name)
 	##     Err(NotFound) => sign_up(email)
 	## }
 	## ```
-	query_optional! : Client(_), Str, List(Param.Param), (PgResult.Row -> Try(a, Client.QueryOptionalErr(_, _, others))) => Try(Try(a, [NotFound]), Client.QueryOptionalErr(_, _, others))
-	query_optional! = |client, sql, params, decode_row| {
-		result = client.command!(Statement.new(sql).bind(params))?
+	query_optional_unchecked! : Client(_, _), Str, List(Param.Param), (PgResult.Row -> Try(a, Client.QueryOptionalErr(_, _, others))) => Try(Try(a, [NotFound]), Client.QueryOptionalErr(_, _, others))
+	query_optional_unchecked! = |client, sql, params, decode_row| {
+		result = client.command!(Statement.new_unchecked(sql).bind(params))?
 		PgResult.decode_optional(result, decode_row)
 	}
 
@@ -413,15 +389,15 @@ Client(stream) :: {
 	## such as `create table`, returns zero.
 	##
 	## ```
-	## updated = client.execute!("update users set seen = now() where id = $1", [Param.i64(id)])?
+	## updated = client.execute_unchecked!("update users set seen = now() where id = $1", [Param.i64(id)])?
 	## if updated == 0 Err(UserNotFound(id)) else Ok({})
 	## ```
 	##
 	## A statement in Roc must be `{}`, so a call that has no use for the
-	## count discards it: `_ = client.execute!(sql, params)?`.
-	execute! : Client(_), Str, List(Param.Param) => Try(U64, Client.CommandErr(_, _, others))
-	execute! = |client, sql, params| {
-		result = client.command!(Statement.new(sql).bind(params))?
+	## count discards it: `_ = client.execute_unchecked!(sql, params)?`.
+	execute_unchecked! : Client(_, _), Str, List(Param.Param) => Try(U64, Client.CommandErr(_, _, others))
+	execute_unchecked! = |client, sql, params| {
+		result = client.command!(Statement.new_unchecked(sql).bind(params))?
 		Ok(PgResult.rows_affected(result))
 	}
 
@@ -430,12 +406,13 @@ Client(stream) :: {
 	## string, a comment or a function body is safe.
 	##
 	## ```
-	## client.batch_execute!("create table users (id serial primary key, name text); create index on users (name)")?
+	## db.batch_execute_unchecked!("create table users (id serial primary key, name text); create index on users (name)")?
 	## ```
 	##
-	## It takes no parameters, because the protocol cannot bind values to a
-	## batch. Never build its SQL from values a user supplied. Use
-	## [Client.execute!] with `$1` placeholders for those.
+	## The SQL is not checked when you build, and it takes no parameters,
+	## because the protocol cannot bind values to a batch. Never build its SQL
+	## from values a user supplied. Use a checked query or
+	## [Client.execute_unchecked!] with placeholders for those.
 	##
 	## Unless the batch has its own `begin` and `commit`, the server runs it as
 	## one transaction: the first statement that fails ends the batch with
@@ -447,11 +424,131 @@ Client(stream) :: {
 	## Rows a `select` returns are read and dropped. `copy` to or from the
 	## client is not supported: it fails with `PgProtoErr`, and the
 	## connection can't be used after it.
-	batch_execute! : Client(_), Str => Try({}, Client.CommandErr(_, _, others))
-	batch_execute! = |client, sql| {
+	batch_execute_unchecked! : Client(_, _), Str => Try({}, Client.CommandErr(_, _, others))
+	batch_execute_unchecked! = |client, sql| {
 		check_no_nul(sql, "sql")?
 		write_all!(client, ProtoFrontend.query(sql))?
 		read_batch!(client)
+	}
+
+	## The errors of a checked query: those of [Client.CommandErr], plus the
+	## problems that only show when the query runs.
+	##
+	## - `PgTypeMismatch({ column, type, field })`: the server reports a column
+	##   type that does not fit its field.
+	## - `PgDecodeErr(message)` and `MissingRequiredField(name)`: a value
+	##   could not be decoded into its field.
+	## - `ParamsNotARecord` and `NestedParam(name)`: the parameters are not a
+	##   flat record.
+	TypedErr(read, write, others) : Client.CommandErr(read, write, [ParamsNotARecord, NestedParam(Str), PgTypeMismatch({ column : Str, type : Str, field : Str }), PgDecodeErr(Str), MissingRequiredField(Str), ..others])
+
+	## [Client.TypedErr] plus `EmptyResult` and `MultipleRows(n)`.
+	TypedOneErr(read, write, others) : Client.TypedErr(read, write, [EmptyResult, MultipleRows(U64), ..others])
+
+	## [Client.TypedErr] plus `MultipleRows(n)`.
+	TypedOptionalErr(read, write, others) : Client.TypedErr(read, write, [MultipleRows(U64), ..others])
+
+	## Run a query and decode every row into the record type you ask for.
+	##
+	## The SQL is a string literal, checked when you build against the
+	## schema of the connection (see [Sql]). Parameters are a record, and each
+	## `$name` in the SQL refers to the field with that name. Pass `{}` when
+	## there are none.
+	##
+	## ```
+	## Student : { id : I32, name : Str, phone : Try(Str, [Null]) }
+	##
+	## by_school! : I32, Db => Try(List(Student), _)
+	## by_school! = |school_id, db|
+	##     db.query!("select id, name, phone from students where school_id = $school_id", { school_id, })
+	## ```
+	##
+	## Columns are matched to fields by name. A column that can be NULL needs
+	## a `Try(T, [Null])` field.
+	query! : Client(_, schema), Sql.Sql(schema, params, row), params => Try(List(row), Client.TypedErr(_, _, others))
+		where [
+			params.encoder_for : ParamFormat -> (params, ParamFormat.State -> Try(ParamFormat.State, ParamFormat.Err)),
+			row.parser_for : RowFormat -> (RowFormat.State -> Try({ value : row, rest : RowFormat.State }, RowFormat.Err)),
+		]
+	query! = |client, sql, params| {
+		Params : params
+		Row : row
+		named = ParamFormat.encode(params, Params.encoder_for(ParamFormat.Text))?
+		fields = RowFormat.shape(Row.parser_for(RowFormat.Nulls), Row.parser_for(RowFormat.Kinds)) ? |_| PgDecodeErr("a field of the row type is a record, which a result row cannot fill")
+		result = run_checked!(client, Sql.text(sql), Sql.params(sql), fields, named)?
+		decode_rows(result, Row.parser_for(RowFormat.Text))
+	}
+
+	## Like `Client.query!`, for a query that returns exactly one row. Fails
+	## with `EmptyResult` if there is none and `MultipleRows(n)` if there are
+	## more.
+	##
+	## ```
+	## student = db.query_one!("select name, phone from students where id = $id", { id, })?
+	## ```
+	query_one! : Client(_, schema), Sql.Sql(schema, params, row), params => Try(row, Client.TypedOneErr(_, _, others))
+		where [
+			params.encoder_for : ParamFormat -> (params, ParamFormat.State -> Try(ParamFormat.State, ParamFormat.Err)),
+			row.parser_for : RowFormat -> (RowFormat.State -> Try({ value : row, rest : RowFormat.State }, RowFormat.Err)),
+		]
+	query_one! = |client, sql, params| {
+		Params : params
+		Row : row
+		named = ParamFormat.encode(params, Params.encoder_for(ParamFormat.Text))?
+		fields = RowFormat.shape(Row.parser_for(RowFormat.Nulls), Row.parser_for(RowFormat.Kinds)) ? |_| PgDecodeErr("a field of the row type is a record, which a result row cannot fill")
+		result = run_checked!(client, Sql.text(sql), Sql.params(sql), fields, named)?
+		match decode_rows(result, Row.parser_for(RowFormat.Text))? {
+			[] => Err(EmptyResult)
+			[row] => Ok(row)
+			rows => Err(MultipleRows(rows.len()))
+		}
+	}
+
+	## Like `Client.query!`, for a query that returns at most one row. Returns
+	## `Ok(row)`, or `Err(NotFound)` when there is no row. Fails with
+	## `MultipleRows(n)` if there is more than one.
+	##
+	## ```
+	## match db.query_optional!("select id from students where email = $email", { email, })? {
+	##     Ok(student) => Ok(student.id)
+	##     Err(NotFound) => sign_up!(email, db)
+	## }
+	## ```
+	query_optional! : Client(_, schema), Sql.Sql(schema, params, row), params => Try(Try(row, [NotFound]), Client.TypedOptionalErr(_, _, others))
+		where [
+			params.encoder_for : ParamFormat -> (params, ParamFormat.State -> Try(ParamFormat.State, ParamFormat.Err)),
+			row.parser_for : RowFormat -> (RowFormat.State -> Try({ value : row, rest : RowFormat.State }, RowFormat.Err)),
+		]
+	query_optional! = |client, sql, params| {
+		Params : params
+		Row : row
+		named = ParamFormat.encode(params, Params.encoder_for(ParamFormat.Text))?
+		fields = RowFormat.shape(Row.parser_for(RowFormat.Nulls), Row.parser_for(RowFormat.Kinds)) ? |_| PgDecodeErr("a field of the row type is a record, which a result row cannot fill")
+		result = run_checked!(client, Sql.text(sql), Sql.params(sql), fields, named)?
+		match decode_rows(result, Row.parser_for(RowFormat.Text))? {
+			[] => Ok(Err(NotFound))
+			[row] => Ok(Ok(row))
+			rows => Err(MultipleRows(rows.len()))
+		}
+	}
+
+	## Like `Client.query!`, for a statement you run for its effect. Returns
+	## how many rows it inserted, updated or deleted.
+	##
+	## ```
+	## updated = db.execute!("update students set phone = $phone where id = $id", { id, phone })?
+	## ```
+	##
+	## When you don't need the count, discard it: `_ = db.execute!(sql, params)?`.
+	execute! : Client(_, schema), Sql.Sql(schema, params, {}), params => Try(U64, Client.TypedErr(_, _, others))
+		where [
+			params.encoder_for : ParamFormat -> (params, ParamFormat.State -> Try(ParamFormat.State, ParamFormat.Err)),
+		]
+	execute! = |client, sql, params| {
+		Params : params
+		named = ParamFormat.encode(params, Params.encoder_for(ParamFormat.Text))?
+		result = run_checked!(client, Sql.text(sql), Sql.params(sql), [], named)?
+		Ok(PgResult.rows_affected(result))
 	}
 
 	## Run `body!` inside one `begin`/`commit` on this connection, which is
@@ -483,12 +580,12 @@ Client(stream) :: {
 	## and puts a warning in the server's log.
 	##
 	## ```
-	## id = client.transaction!(|db| {
-	##     _ = db.execute!("insert into sources (name) values ($1)", [Param.str(name)])?
-	##     db.query_one!("insert into leads (source_id) values (currval('sources_id_seq')) returning id", [], |row| row.i32("id"))
+	## lead = db.transaction!(|tx| {
+	##     source = tx.query_one!("insert into sources (name) values ($name) returning id", { name, })?
+	##     tx.query_one!("insert into leads (source_id) values ($source_id) returning id", { source_id: source.id })
 	## })?
 	## ```
-	transaction! : Client(_), (Client(_) => Try(a, Client.TransactionErr(_, _, others))) => Try(a, Client.TransactionErr(_, _, others))
+	transaction! : Client(_, schema), (Client(_, schema) => Try(a, Client.TransactionErr(_, _, others))) => Try(a, Client.TransactionErr(_, _, others))
 	transaction! = |client, body!|
 		match open_transaction!(client) {
 			Err(err) => Err(TransactionBeginFailed(err))
@@ -517,8 +614,8 @@ Client(stream) :: {
 	## (see `statement_name`), so two different queries prepared under one
 	## name on one connection cannot replace each other. A [Statement] whose
 	## named statement was replaced would silently run the other query.
-	prepare! : Client(_), Str, { name : Str } => Try(Statement.Statement, Client.CommandErr(_, _, others))
-	prepare! = |client, sql, { name: given_name }| {
+	prepare_unchecked! : Client(_, _), Str, { name : Str } => Try(Statement.Statement, Client.CommandErr(_, _, others))
+	prepare_unchecked! = |client, sql, { name: given_name }| {
 		check_no_nul(sql, "sql")?
 		check_no_nul(given_name, "statement name")?
 		name = statement_name(sql, given_name)
@@ -549,7 +646,7 @@ Client(stream) :: {
 	## Tell the server the session is over (Terminate). The write is best
 	## effort: a dead connection is over anyway. The platform closes the
 	## stream once nothing refers to the client anymore.
-	close! : Client(_) => {}
+	close! : Client(_, _) => {}
 	close! = |client| {
 		_ = write_all!(client, ProtoFrontend.terminate)
 		{}
@@ -559,7 +656,7 @@ Client(stream) :: {
 	## up in: `Idle`, `TransactionBlock`, or `FailedTransactionBlock`. A
 	## cheap check that the server still answers, and of whether the session
 	## was left inside a transaction.
-	sync_status! : Client(_) => Try(Client.TransactionStatus, Client.CommandErr(_, _, others))
+	sync_status! : Client(_, _) => Try(Client.TransactionStatus, Client.CommandErr(_, _, others))
 	sync_status! = |client| {
 		write_all!(client, ProtoFrontend.sync)?
 		drained = read_ready_for_query!(client)?
@@ -598,6 +695,54 @@ Client(stream) :: {
 
 		"${err.localized_severity} (${err.code}): ${err.message}${fields_str}"
 	}
+}
+
+## The body of [Client.command!], which also returns the result's column
+## types, for [run_checked!] to check.
+run_statement! : Client(_, _), Statement.Statement => Try({ result : PgResult.PgResult, columns : List(ProtoBackend.Column) }, Client.CommandErr(_, _, others))
+run_statement! = |client, stmt| {
+	{ format_codes, param_values } = Param.encode(stmt.params)
+
+	# A named prepared statement only exists on the connection it was
+	# prepared on. When this statement was prepared on a DIFFERENT
+	# connection, fall back to re-parsing its SQL as an unnamed
+	# statement, which is correct on any connection, at the cost of one
+	# extra Parse.
+	plan =
+		match stmt.kind {
+			Sql(sql) => {
+				check_no_nul(sql, "sql")?
+				UnnamedFlow(sql)
+			}
+			Prepared(prepared) =>
+				match (client.backend_key, prepared.prepared_on()) {
+					# Backend keys are only unique within one server, so
+					# statements prepared against a different host could
+					# in principle collide.
+					(Known(current), Known(origin)) if current.process_id == origin.process_id and current.secret_key == origin.secret_key => PreparedFlow(prepared)
+					_ => UnnamedFlow(prepared.sql())
+				}
+		}
+
+	messages =
+		match plan {
+			UnnamedFlow(sql) => unnamed_messages(sql, format_codes, param_values)
+			PreparedFlow(prepared) =>
+				[
+					ProtoFrontend.bind({ prepared_statement: prepared.name(), format_codes: format_codes, param_values: param_values }),
+					ProtoFrontend.execute,
+					ProtoFrontend.sync,
+				]
+			}
+
+	init_columns =
+		match plan {
+			UnnamedFlow(_) => []
+			PreparedFlow(prepared) => prepared.columns()
+		}
+
+	write_all!(client, Bytes.sequence(messages))?
+	read_reply!(client, init_columns)
 }
 
 ## The `timeout_ms` of [Client.connect!] when none is given: 5 seconds more
@@ -659,7 +804,7 @@ expect check_no_nul("select 1\u(0)drop table x", "sql") == Err(ContainsNul("sql"
 ## tail of a client method's error union (see the module doc). A `match`
 ## rather than `.map_err`: static dispatch cannot resolve a method on the
 ## effect function's return type.
-write_all! : Client(_), List(U8) => Try({}, [PgWriteErr(_), ..others])
+write_all! : Client(_, _), List(U8) => Try({}, [PgWriteErr(_), ..others])
 write_all! = |client, bytes| {
 	match client.stream.write!(bytes, client.timeout_ms) {
 		Ok(v) => Ok(v)
@@ -667,7 +812,7 @@ write_all! = |client, bytes| {
 	}
 }
 
-read_bytes! : Client(_), U64 => Try(List(U8), [PgReadErr(_), ..others])
+read_bytes! : Client(_, _), U64 => Try(List(U8), [PgReadErr(_), ..others])
 read_bytes! = |client, len| {
 	match client.stream.read_exactly!(len, client.timeout_ms) {
 		Ok(bytes) => Ok(bytes)
@@ -676,7 +821,7 @@ read_bytes! = |client, len| {
 }
 
 ## Read one backend message from the stream.
-read_message! : Client(_) => Try(ProtoBackend.Message, [PgReadErr(_), PgProtoErr(ProtoBackend.ProtoErr), ..others])
+read_message! : Client(_, _) => Try(ProtoBackend.Message, [PgReadErr(_), PgProtoErr(ProtoBackend.ProtoErr), ..others])
 read_message! = |client| {
 	header_bytes = read_bytes!(client, 5)?
 	{ msg_type, len } =
@@ -701,7 +846,7 @@ read_message! = |client| {
 ## The startup conversation: send the startup message, answer an auth
 ## challenge if the server sends one, then collect the backend key until
 ## ReadyForQuery.
-do_startup! : _, { user : Str, database : Str, auth : [NoAuth, Password(Str)], timeout_ms : U64, params : List((Str, Str)), auth_methods : List([Scram, Md5, Cleartext, Trust]), random_u64! : () => Try(U64, _) } => Try(Client(_), Client.StartupErr(_, _, others))
+do_startup! : _, { user : Str, database : Str, auth : [NoAuth, Password(Str)], timeout_ms : U64, params : List((Str, Str)), auth_methods : List([Scram, Md5, Cleartext, Trust]), random_u64! : () => Try(U64, _) } => Try(Client(_, _), Client.StartupErr(_, _, others))
 do_startup! = |stream, { user, database, auth, timeout_ms, params, auth_methods, random_u64! }| {
 	client = Client.{ stream, timeout_ms, backend_key: Pending, in_transaction: Bool.False }
 	write_all!(client, ProtoFrontend.startup({ user, database, params }))?
@@ -715,7 +860,7 @@ all_auth_methods = [Scram, Md5, Cleartext, Trust]
 ## The login and the rest of the startup, one backend message at a time.
 ## `login` is how far the authentication got, which decides what the server
 ## may send next: `Waiting`, `PasswordSent`, the SCRAM steps, `Authenticated`.
-startup_loop! : Client(_), { user : Str, auth : [NoAuth, Password(Str)], auth_methods : List([Scram, Md5, Cleartext, Trust]), random_u64! : () => Try(U64, _) }, _ => Try(Client(_), Client.StartupErr(_, _, others))
+startup_loop! : Client(_, _), { user : Str, auth : [NoAuth, Password(Str)], auth_methods : List([Scram, Md5, Cleartext, Trust]), random_u64! : () => Try(U64, _) }, _ => Try(Client(_, _), Client.StartupErr(_, _, others))
 startup_loop! = |client, settings, login|
 	match read_message!(client)? {
 		AuthOk => {
@@ -850,6 +995,42 @@ sasl_text = |data|
 unexpected_in_login : Str -> Try(a, [PgProtoErr(ProtoBackend.ProtoErr), ..others])
 unexpected_in_login = |what| Err(PgProtoErr(UnexpectedMsg("${what} out of turn in the login")))
 
+## Bind the named parameters in the query's order, run it, and check the
+## result's column types against the row type's fields.
+run_checked! : Client(_, _), Str, List(Str), List(RowFormat.Field), List((Str, Param.Param)) => Try(PgResult.PgResult, Client.TypedErr(_, _, others))
+run_checked! = |client, text, names, fields, named| {
+	ordered = ParamFormat.bind(names, named)
+	# `text` was checked when the app was built, by `Sql.from_quote`.
+	{ result, columns } = run_statement!(client, Statement.new_unchecked(text).bind(ordered))?
+	for column in columns {
+		match fields.find_first(|f| f.name == column.name) {
+			Ok(field) =>
+				match Check.oid_type(column.type_oid) {
+					Ok(type) if !Check.compatible(type, field.kind) => return Err(PgTypeMismatch({ column: column.name, type, field: field.kind }))
+					_ => {}
+				}
+			Err(_) => {}
+		}
+	}
+	Ok(result)
+}
+
+decode_rows : PgResult.PgResult, (RowFormat.State -> Try({ value : row, rest : RowFormat.State }, RowFormat.Err)) -> Try(List(row), [PgDecodeErr(Str), MissingRequiredField(Str), ..others])
+decode_rows = |result, parse| {
+	names = PgResult.field_names(result)
+	var $rows = []
+	for values in PgResult.rows(result) {
+		row =
+			match RowFormat.decode(names, values, parse) {
+				Ok(decoded) => decoded
+				Err(PgDecodeErr(message)) => return Err(PgDecodeErr(message))
+				Err(MissingRequiredField(name)) => return Err(MissingRequiredField(name))
+			}
+		$rows = $rows.append(row)
+	}
+	Ok($rows)
+}
+
 ## The messages that run `sql` once as an unnamed statement: Parse, Bind,
 ## Describe, Execute and Sync.
 unnamed_messages : Str, List([Text, Binary]), List([Null, Value(List(U8))]) -> List(List(U8))
@@ -867,7 +1048,7 @@ unnamed_messages = |sql, format_codes, param_values| [
 ## ReadyForQuery, so this drains to it before returning the error.
 ## Otherwise the next command on this connection would read this
 ## conversation's leftover messages.
-read_reply! : Client(_), List(ProtoBackend.Column) => Try(PgResult.PgResult, Client.CommandErr(_, _, others))
+read_reply! : Client(_, _), List(ProtoBackend.Column) => Try({ result : PgResult.PgResult, columns : List(ProtoBackend.Column) }, Client.CommandErr(_, _, others))
 read_reply! = |client, init_columns|
 	match read_cmd_result!(client, init_columns, []) {
 		Ok(result) =>
@@ -888,7 +1069,7 @@ read_reply! = |client, init_columns|
 ## further ErrorResponse in the drain never replaces it. After a FATAL or
 ## PANIC the server closes the connection and sends nothing more, so waiting
 ## for ReadyForQuery would only turn the error into a failed read.
-drain_after_error! : Client(_), ProtoBackend.Error => Try(a, Client.CommandErr(_, _, others))
+drain_after_error! : Client(_, _), ProtoBackend.Error => Try(a, Client.CommandErr(_, _, others))
 drain_after_error! = |client, error|
 	if closes_connection(error) {
 		Err(PgErr(error))
@@ -919,7 +1100,7 @@ savepoint = "roc_pg_transaction"
 ## client, does that `begin` land inside one. It changes nothing there (the
 ## server only warns), and inside a failed transaction it is refused like
 ## any other statement.
-open_transaction! : Client(_) => Try([Outermost, Nested], Client.CommandErr(_, _, others))
+open_transaction! : Client(_, _) => Try([Outermost, Nested], Client.CommandErr(_, _, others))
 open_transaction! = |client|
 	if client.in_transaction {
 		open_savepoint!(client)
@@ -934,19 +1115,19 @@ open_transaction! = |client|
 		}
 	}
 
-open_savepoint! : Client(_) => Try([Outermost, Nested], Client.CommandErr(_, _, others))
+open_savepoint! : Client(_, _) => Try([Outermost, Nested], Client.CommandErr(_, _, others))
 open_savepoint! = |client| {
-	_ = Client.command!(client, Statement.new("savepoint ${savepoint}"))?
+	_ = Client.command!(client, Statement.new_unchecked("savepoint ${savepoint}"))?
 	Ok(Nested)
 }
 
 ## Finish a transaction whose body succeeded: `commit` the outermost one,
 ## `release` the savepoint of a nested one.
-close_transaction! : Client(_), [Outermost, Nested] => Try({}, [TransactionAborted, TransactionCommitRefused(Client.ServerError), TransactionCommitFailed(Client.CommandErr(_, _, [])), ..others])
+close_transaction! : Client(_, _), [Outermost, Nested] => Try({}, [TransactionAborted, TransactionCommitRefused(Client.ServerError), TransactionCommitFailed(Client.CommandErr(_, _, [])), ..others])
 close_transaction! = |client, level|
 	match level {
 		Outermost =>
-			match Client.command!(client, Statement.new("commit")) {
+			match Client.command!(client, Statement.new_unchecked("commit")) {
 				# The commit of a transaction in which a statement failed is
 				# answered with a ROLLBACK tag, not an error.
 				Ok(result) if PgResult.command_tag(result) == "ROLLBACK" => Err(TransactionAborted)
@@ -956,7 +1137,7 @@ close_transaction! = |client, level|
 			}
 
 		Nested =>
-			match Client.command!(client, Statement.new("release savepoint ${savepoint}")) {
+			match Client.command!(client, Statement.new_unchecked("release savepoint ${savepoint}")) {
 				Ok(_) => Ok({})
 				Err(PgErr(error)) => {
 					# Roll back to the savepoint, which also clears a failed
@@ -974,31 +1155,31 @@ close_transaction! = |client, level|
 ## Undo a transaction whose body failed: `rollback` the outermost one, roll
 ## back to the savepoint of a nested one and release it. Best effort: when
 ## this fails, the connection's next statement fails too.
-undo_transaction! : Client(_), [Outermost, Nested] => {}
+undo_transaction! : Client(_, _), [Outermost, Nested] => {}
 undo_transaction! = |client, level|
 	match level {
 		Outermost => {
-			_ = Client.command!(client, Statement.new("rollback"))
+			_ = Client.command!(client, Statement.new_unchecked("rollback"))
 			{}
 		}
 
 		Nested => {
-			_ = Client.command!(client, Statement.new("rollback to savepoint ${savepoint}"))
-			_ = Client.command!(client, Statement.new("release savepoint ${savepoint}"))
+			_ = Client.command!(client, Statement.new_unchecked("rollback to savepoint ${savepoint}"))
+			_ = Client.command!(client, Statement.new_unchecked("release savepoint ${savepoint}"))
 			{}
 		}
 	}
 
 ## Collect data rows until the command completes.
-read_cmd_result! : Client(_), List(ProtoBackend.Column), List(List([Null, Present(List(U8))])) => Try(PgResult.PgResult, Client.CommandErr(_, _, others))
+read_cmd_result! : Client(_, _), List(ProtoBackend.Column), List(List([Null, Present(List(U8))])) => Try({ result : PgResult.PgResult, columns : List(ProtoBackend.Column) }, Client.CommandErr(_, _, others))
 read_cmd_result! = |client, columns, rows|
 	match read_message!(client)? {
 		ParseComplete | BindComplete | ParameterDescription | NoData => read_cmd_result!(client, columns, rows)
 		ParameterStatus(_) | NoticeResponse => read_cmd_result!(client, columns, rows)
 		RowDescription(new_columns) => read_cmd_result!(client, new_columns, rows)
 		DataRow(row) => read_cmd_result!(client, columns, rows.append(row))
-		CommandComplete(tag) => Ok(PgResult.new(columns.map(|column| column.name), rows, tag))
-		EmptyQueryResponse => Ok(PgResult.new(columns.map(|column| column.name), rows, ""))
+		CommandComplete(tag) => Ok({ result: PgResult.new(columns.map(|column| column.name), rows, tag), columns })
+		EmptyQueryResponse => Ok({ result: PgResult.new(columns.map(|column| column.name), rows, ""), columns })
 		ErrorResponse(error) => Err(PgErr(error))
 		other => Err(PgProtoErr(UnexpectedMsg(Str.inspect(other))))
 	}
@@ -1007,7 +1188,7 @@ read_cmd_result! = |client, columns, rows|
 ## ends in CommandComplete (or EmptyQueryResponse), and a `select` sends
 ## its rows first, which are dropped. An error ends the batch, and the
 ## server still answers ReadyForQuery, which drain_after_error! reads.
-read_batch! : Client(_) => Try({}, Client.CommandErr(_, _, others))
+read_batch! : Client(_, _) => Try({}, Client.CommandErr(_, _, others))
 read_batch! = |client|
 	match read_message!(client)? {
 		RowDescription(_) | DataRow(_) | CommandComplete(_) | EmptyQueryResponse => read_batch!(client)
@@ -1024,11 +1205,11 @@ read_batch! = |client|
 ## transport and protocol failures are returned as `Err`, and a FATAL or
 ## PANIC error, after which the server closes the connection instead of
 ## answering ReadyForQuery.
-read_ready_for_query! : Client(_) => Try({ status : ProtoBackend.Status, outcome : [NoError, SawError(ProtoBackend.Error)] }, [PgErr(ProtoBackend.Error), PgReadErr(_), PgProtoErr(ProtoBackend.ProtoErr), ..others])
+read_ready_for_query! : Client(_, _) => Try({ status : ProtoBackend.Status, outcome : [NoError, SawError(ProtoBackend.Error)] }, [PgErr(ProtoBackend.Error), PgReadErr(_), PgProtoErr(ProtoBackend.ProtoErr), ..others])
 read_ready_for_query! = |client|
 	drain_loop!(client, NoError)
 
-drain_loop! : Client(_), [NoError, SawError(ProtoBackend.Error)] => Try({ status : ProtoBackend.Status, outcome : [NoError, SawError(ProtoBackend.Error)] }, [PgErr(ProtoBackend.Error), PgReadErr(_), PgProtoErr(ProtoBackend.ProtoErr), ..others])
+drain_loop! : Client(_, _), [NoError, SawError(ProtoBackend.Error)] => Try({ status : ProtoBackend.Status, outcome : [NoError, SawError(ProtoBackend.Error)] }, [PgErr(ProtoBackend.Error), PgReadErr(_), PgProtoErr(ProtoBackend.ProtoErr), ..others])
 drain_loop! = |client, first|
 	match drain_step(read_message!(client)?, first) {
 		Continue(next) => drain_loop!(client, next)
@@ -1055,7 +1236,7 @@ drain_step = |msg, first|
 	}
 
 ## Collect the column names of a just-prepared statement until ReadyForQuery.
-read_prepare_columns! : Client(_), List(ProtoBackend.Column) => Try(List(ProtoBackend.Column), Client.CommandErr(_, _, others))
+read_prepare_columns! : Client(_, _), List(ProtoBackend.Column) => Try(List(ProtoBackend.Column), Client.CommandErr(_, _, others))
 read_prepare_columns! = |client, columns|
 	match read_message!(client)? {
 		CloseComplete | ParseComplete | ParameterDescription | NoData => read_prepare_columns!(client, columns)

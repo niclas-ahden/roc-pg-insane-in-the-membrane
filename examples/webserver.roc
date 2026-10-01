@@ -19,9 +19,14 @@ import pf.Tcp
 import http.Response
 import pg.Client
 import pg.Param
+import pg.NoSchema
 
 ## Where to connect. Never a connection, which every request would share.
 Context : { host : Str, port : U16, user : Str, database : Str }
+
+## A connection on basic-webserver. `NoSchema` because this example only
+## runs unchecked queries.
+Db : Client.Client(Client.FixedTimeout(Tcp.Stream), NoSchema)
 
 program = { init!, respond!, shutdown! }
 
@@ -53,7 +58,7 @@ respond! = |_request, context|
 with_db! = |{ host, port, user, database }, body!| {
 	db = Client.connect!({
 		# basic-webserver's streams take no timeout: the platform gives each
-		# dial, read and write a fixed 30 seconds.
+		# connect, read and write a fixed 30 seconds.
 		connect!: Client.fixed_timeout(Tcp.connect!),
 		# basic-webserver has no random numbers, which only a SCRAM login
 		# needs. Log in to PgBouncer another way, such as trust or md5.
@@ -69,15 +74,16 @@ with_db! = |{ host, port, user, database }, body!| {
 	result
 }
 
+demo! : Db => Try(List(Str), _)
 demo! = |db| {
-	greeting = db.query_one!("select 'hello from Postgres' as greeting", [], |row| row.str("greeting"))?
+	greeting = db.query_one_unchecked!("select 'hello from Postgres' as greeting", [], |row| row.str("greeting"))?
 
 	# One transaction: both statements land, or neither does.
 	total = db.transaction!(
 		|tx| {
-			_ = tx.execute!("create temp table numbers (n int) on commit drop", [])?
-			_ = tx.execute!("insert into numbers values ($1), ($2)", [Param.i32(20), Param.i32(22)])?
-			tx.query_one!("select sum(n)::int as total from numbers", [], |row| row.i32("total"))
+			_ = tx.execute_unchecked!("create temp table numbers (n int) on commit drop", [])?
+			_ = tx.execute_unchecked!("insert into numbers values ($1), ($2)", [Param.i32(20), Param.i32(22)])?
+			tx.query_one_unchecked!("select sum(n)::int as total from numbers", [], |row| row.i32("total"))
 		},
 	)?
 

@@ -1,8 +1,10 @@
-## A value bound to a `$n` placeholder of a [Statement]: SQL NULL, a text
-## value, raw bytes, or an array of such values.
+## A value bound to a `$n` placeholder of a [Statement] or of SQL built at
+## runtime, such as with `Client.query_unchecked!`: SQL NULL, a text value,
+## raw bytes, or an array of such values. Checked queries take a record of
+## parameters instead.
 ##
 ## ```
-## client.query!(
+## client.query_unchecked!(
 ##     "select name from people where age > $1 and team = any($2)",
 ##     [Param.u8(18), Param.list([Param.str("red"), Param.str("blue")])],
 ##     |row| row.str("name"),

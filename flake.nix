@@ -1,5 +1,5 @@
 {
-  description = "roc-pg";
+  description = "roc-pg-insane-in-the-membrane";
 
   nixConfig = {
     extra-substituters = [ "https://niclas-ahden.cachix.org" ];

@@ -1,0 +1,524 @@
+## Your database's tables, views, enum types, domains and functions, which
+## checked queries are checked against. It is read from a schema dump:
+##
+## ```sh
+## pg_dump --schema-only --no-owner mydb > schema.sql
+## ```
+##
+## Read the dump with [Catalog.from_schema] and wrap it in a type that
+## connections carry:
+##
+## ```
+## import "schema.sql" as schema_sql : Str
+##
+## catalog : Catalog
+## catalog = Catalog.from_schema(schema_sql)
+##
+## Schema := [].{
+##     catalog : {} -> Catalog
+##     catalog = |{}| catalog
+## }
+##
+## Db : Client.Client(Tcp.Stream, Schema)
+## ```
+##
+## Dump the schema again after each migration. Each statement that
+## describes a table, a view, an enum, a domain or a function is read with
+## Postgres's own grammar. Everything else in the dump (indexes, sequences,
+## grants, comments) is skipped, and so is a statement the grammar refuses.
+import Lex
+import Node
+import Parse
+
+Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions : List(Catalog.Function), extensions : List(Str) }.{
+	## A table or a view. A view's columns are the ones its query returns,
+	## which the analysis works out when a query reads it. `primary_key` is
+	## empty for a table without one. `triggers` is whether a trigger is
+	## defined on the table, which may fill in a column an insert leaves out.
+	Table : { name : Str, schema : Str, columns : [Known(List(Catalog.Column)), View({ query : Node, aliases : List(Str) }), Unknown], primary_key : List(Str), triggers : Bool }
+
+	## `type` is the column's type as `pg_dump` spells it, without a schema
+	## or a length: `integer`, `character varying`, `timestamp without time
+	## zone`, `access_level`, `integer[]`. A column of a domain has the
+	## domain's base type, and is `NOT NULL` when the domain is. `has_default`
+	## is whether an insert may leave it out: it has a default, is an identity
+	## or is generated.
+	Column : { name : Str, type : Str, not_null : Bool, has_default : Bool }
+
+	Enum : { name : Str, labels : List(Str) }
+
+	## A function of the schema. `args` are the types it takes, the last
+	## `defaults` of which may be left out. A function with several `OUT`
+	## parameters or `returns table` returns `record`, and `outputs` are its
+	## columns.
+	Function : { name : Str, args : List(Str), defaults : U64, variadic : Bool, result : Str, set : Bool, strict : Bool, outputs : List({ name : Str, type : Str }) }
+
+	empty : Catalog
+	empty = Catalog.{ tables: [], enums: [], functions: [], extensions: [] }
+
+	is_empty : Catalog -> Bool
+	is_empty = |catalog| catalog.tables.is_empty()
+
+	tables : Catalog -> List(Catalog.Table)
+	tables = |catalog| catalog.tables
+
+	## The names of the enum types.
+	enums : Catalog -> List(Str)
+	enums = |catalog| catalog.enums.map(|e| e.name)
+
+	## The labels of enum type `name`, in their order.
+	enum_labels : Catalog, Str -> Try(List(Str), [NotFound])
+	enum_labels = |catalog, name|
+		match catalog.enums.find_first(|e| e.name == name) {
+			Ok(e) => Ok(e.labels)
+			Err(_) => Err(NotFound)
+		}
+
+	functions : Catalog -> List(Catalog.Function)
+	functions = |catalog| catalog.functions
+
+	## The extensions the dump creates, other than `plpgsql`. Their functions,
+	## operators and types are not in the dump.
+	extensions : Catalog -> List(Str)
+	extensions = |catalog| catalog.extensions
+
+	table : Catalog, Str -> Try(Catalog.Table, [NotFound])
+	table = |catalog, name| catalog.tables.find_first(|t| t.name == name)
+
+	## Read a schema dump, as a top-level constant over an imported file (see
+	## the example above). It runs while the app builds, so a file that is
+	## not valid SQL stops the build.
+	from_schema : Str -> Catalog
+	from_schema = |sql|
+		match Catalog.parse(sql) {
+			Ok(catalog) => catalog
+			Err(BadSchema(message)) => crash "schema.sql: ${message}"
+		}
+
+	## Read a schema dump. Fails only when the text does not lex as SQL.
+	parse : Str -> Try(Catalog, [BadSchema(Str)])
+	parse = |dump| {
+		sql = without_meta_commands(dump)
+		toks = Lex.tokens(sql) ? |err| BadSchema(Lex.err_to_str(sql, err))
+		var $tables = []
+		var $enums = []
+		var $domains = []
+		var $functions = []
+		var $extensions = []
+		for statement in statements(sql, toks) {
+			if wanted(statement.kinds) {
+				match Parse.parse(statement.text) {
+					Ok([RawStmt(raw)]) =>
+						match raw.stmt {
+							CreateStmt(s) => {
+								$tables = $tables.append(create_table(s))
+							}
+							ViewStmt(v) => {
+								{ name, schema } = relation_name(v.view)
+								$tables = $tables.append({ name, schema, columns: View({ query: v.query, aliases: names_of(v.aliases) }), primary_key: [], triggers: Bool.False })
+							}
+							CreateTableAsStmt(c) if c.objtype == 23 =>
+								match c.into {
+									IntoClause(into) => {
+										{ name, schema } = relation_name(into.rel)
+										$tables = $tables.append({ name, schema, columns: View({ query: c.query, aliases: names_of(into.col_names) }), primary_key: [], triggers: Bool.False })
+									}
+									_ => {}
+								}
+							AlterTableStmt(a) => {
+								{ name, .. } = relation_name(a.relation)
+								$tables = $tables.map(|t| if t.name == name alter_table(t, a.cmds) else t)
+							}
+							CreateEnumStmt(e) => {
+								$enums = $enums.append({ name: names_of(e.type_name).last() ?? "", labels: names_of(e.vals) })
+							}
+							CreateDomainStmt(d) => {
+								not_null = d.constraints.any(|c| constraint_type(c) == 1)
+								$domains = $domains.append({ name: names_of(d.domainname).last() ?? "", base: Catalog.type_name(d.type_name), not_null })
+							}
+							CreateFunctionStmt(f) if !f.is_procedure => {
+								$functions = $functions.append(create_function(f))
+							}
+							CreateTrigStmt(trigger) => {
+								{ name, .. } = relation_name(trigger.relation)
+								$tables = $tables.map(|t| if t.name == name { ..t, triggers: Bool.True } else t)
+							}
+							CreateExtensionStmt(e) if e.extname != Ok("plpgsql") => {
+								$extensions = $extensions.append(e.extname ?? "")
+							}
+							_ => {}
+						}
+					_ => {}
+				}
+			}
+		}
+		domains = $domains
+		resolved = $tables.map(
+			|t|
+				match t.columns {
+					Known(columns) => { ..t, columns: Known(columns.map(|c| resolve_domain(c, domains))) }
+					_ => t
+				},
+		)
+		Ok(Catalog.{ tables: resolved, enums: $enums, functions: $functions, extensions: $extensions })
+	}
+
+	## The type a `TypeName` node names, spelled as `pg_dump` spells column
+	## types: `pg_catalog.int4` is `integer`, `varchar(255)` is `character
+	## varying`, `public.access_level` is `access_level`, `int[]` is `integer[]`.
+	type_name : Node -> Str
+	type_name = |node|
+		match node {
+			TypeName(t) => {
+				base = canonical_type(names_of(t.names).last() ?? "")
+				if t.array_bounds.is_empty() base else "${base}[]"
+			}
+			_ => ""
+		}
+}
+
+## The grammar's internal name of a built in type, as `pg_dump` writes it.
+canonical_type : Str -> Str
+canonical_type = |name|
+	match name {
+		"int2" => "smallint"
+		"int4" => "integer"
+		"int8" => "bigint"
+		"float4" => "real"
+		"float8" => "double precision"
+		"bool" => "boolean"
+		"varchar" => "character varying"
+		"bpchar" => "character"
+		"varbit" => "bit varying"
+		"timestamp" => "timestamp without time zone"
+		"timestamptz" => "timestamp with time zone"
+		"time" => "time without time zone"
+		"timetz" => "time with time zone"
+		"decimal" => "numeric"
+		_ => name
+	}
+
+Domain : { name : Str, base : Str, not_null : Bool }
+
+resolve_domain : Catalog.Column, List(Domain) -> Catalog.Column
+resolve_domain = |column, domains|
+	match domains.find_first(|d| d.name == column.type) {
+		Ok(domain) => { ..column, type: domain.base, not_null: column.not_null or domain.not_null }
+		Err(_) => column
+	}
+
+## `pg_dump` 17.6 and later put psql's `\restrict` and `\unrestrict` around
+## the dump. They are not SQL.
+without_meta_commands : Str -> Str
+without_meta_commands = |sql| Str.join_with(sql.split_on("\n").drop_if(|line| line.starts_with("\\")), "\n")
+
+## The statements of a dump: the text of each, and its tokens' kinds.
+statements : Str, List(Lex.Token) -> List({ text : Str, kinds : List(Lex.Kind) })
+statements = |sql, toks| {
+	bytes = sql.to_utf8()
+	var $out = []
+	var $current = []
+	for tok in toks.append({ kind: Punct(';'), start: bytes.len(), end: bytes.len() }) {
+		if tok.kind == Punct(';') {
+			match ($current.first(), $current.last()) {
+				(Ok(first), Ok(last)) => {
+					text = Str.from_utf8_lossy(bytes.sublist({ start: first.start, len: last.end - first.start }))
+					$out = $out.append({ text, kinds: $current.map(|t| t.kind) })
+				}
+				_ => {}
+			}
+			$current = []
+		} else {
+			$current = $current.append(tok)
+		}
+	}
+	$out
+}
+
+## Whether a statement can describe a table, a view, an enum, a domain, a
+## function, a trigger or an extension. Only those are parsed, which keeps reading a dump cheap.
+wanted : List(Lex.Kind) -> Bool
+wanted = |kinds|
+	match kinds {
+		[Word("create"), Word("table"), ..] | [Word("create"), Word("unlogged"), Word("table"), ..] => Bool.True
+		[Word("create"), Word("view"), ..] | [Word("create"), Word("or"), Word("replace"), Word("view"), ..] => Bool.True
+		[Word("create"), Word("materialized"), Word("view"), ..] => Bool.True
+		[Word("create"), Word("type"), ..] => kinds.contains(Word("enum"))
+		[Word("create"), Word("domain"), ..] => Bool.True
+		[Word("create"), Word("function"), ..] | [Word("create"), Word("or"), Word("replace"), Word("function"), ..] => Bool.True
+		[Word("alter"), Word("table"), ..] => kinds.contains(Word("primary")) or kinds.contains(Word("null")) or kinds.contains(Word("column"))
+		[Word("create"), Word("trigger"), ..] | [Word("create"), Word("constraint"), Word("trigger"), ..] | [Word("create"), Word("or"), Word("replace"), Word("trigger"), ..] => Bool.True
+		[Word("create"), Word("extension"), ..] => Bool.True
+		_ => Bool.False
+	}
+
+relation_name : Node -> { name : Str, schema : Str }
+relation_name = |node|
+	match node {
+		RangeVar(r) => { name: r.relname ?? "", schema: r.schemaname ?? "public" }
+		_ => { name: "", schema: "" }
+	}
+
+## A table's columns and primary key. A table that inherits another one's
+## columns, or takes them from a type or `like`, has columns this does not
+## see, so they are unknown.
+create_table : Node.CreateStmt -> Catalog.Table
+create_table = |s| {
+	{ name, schema } = relation_name(s.relation)
+	constraints = s.table_elts.concat(s.constraints).concat(s.nnconstraints)
+	primary_key = constraints.fold([], |acc, c| if constraint_type(c) == 6 acc.concat(constraint_keys(c)) else acc)
+	not_null = constraints.fold([], |acc, c| if constraint_type(c) == 1 acc.concat(constraint_keys(c)) else acc)
+	defined = s.table_elts.keep_oks(
+		|elt|
+			match elt {
+				ColumnDef(c) => Ok(column(c))
+				_ => Err(NotAColumn)
+			},
+	)
+	others =
+		s.table_elts.any(
+			|elt|
+				match elt {
+					ColumnDef(_) => Bool.False
+					Constraint(_) => Bool.False
+					_ => Bool.True
+				},
+		)
+	columns =
+		if others or !s.inh_relations.is_empty() or s.partbound != Null or s.of_typename != Null {
+			Unknown
+		} else {
+			Known(defined.map(|c| if primary_key.contains(c.name) or not_null.contains(c.name) { ..c, not_null: Bool.True } else c))
+		}
+	{ name, schema, columns, primary_key, triggers: Bool.False }
+}
+
+column : Node.ColumnDef -> Catalog.Column
+column = |c| {
+	not_null = c.is_not_null or c.constraints.any(|con| constraint_type(con) == 1 or constraint_type(con) == 6)
+	# A default, an identity or a generated column.
+	has_default = c.raw_default != Null or c.identity != 0 or c.generated != 0 or c.constraints.any(|con| [2, 3, 4].contains(constraint_type(con)))
+	{ name: c.colname ?? "", type: Catalog.type_name(c.type_name), not_null, has_default }
+}
+
+constraint_type : Node -> I64
+constraint_type = |node|
+	match node {
+		Constraint(c) => c.contype
+		_ => -1
+	}
+
+constraint_keys : Node -> List(Str)
+constraint_keys = |node|
+	match node {
+		Constraint(c) => names_of(c.keys)
+		_ => []
+	}
+
+## `add constraint ... primary key (cols)`, `alter column c set not null`,
+## `alter column c set default ...`, `alter column c add generated ... as
+## identity` and `add column`.
+alter_table : Catalog.Table, List(Node) -> Catalog.Table
+alter_table = |table, cmds|
+	cmds.fold(
+		table,
+		|t, cmd|
+			match cmd {
+				AlterTableCmd(c) =>
+					if c.subtype == 16 and constraint_type(c.def) == 6 {
+						keys = constraint_keys(c.def)
+						{ ..set_not_null(t, keys), primary_key: t.primary_key.concat(keys) }
+					} else if c.subtype == 5 {
+						set_not_null(t, [c.name ?? ""])
+					} else if (c.subtype == 2 and c.def != Null) or c.subtype == 62 {
+						set_has_default(t, c.name ?? "")
+					} else if c.subtype == 0 {
+						match (t.columns, c.def) {
+							(Known(columns), ColumnDef(def)) => { ..t, columns: Known(columns.append(column(def))) }
+							_ => t
+						}
+					} else {
+						t
+					}
+				_ => t
+			},
+	)
+
+set_has_default : Catalog.Table, Str -> Catalog.Table
+set_has_default = |table, name|
+	match table.columns {
+		Known(columns) => { ..table, columns: Known(columns.map(|c| if c.name == name { ..c, has_default: Bool.True } else c)) }
+		_ => table
+	}
+
+set_not_null : Catalog.Table, List(Str) -> Catalog.Table
+set_not_null = |table, names|
+	match table.columns {
+		Known(columns) => { ..table, columns: Known(columns.map(|c| if names.contains(c.name) { ..c, not_null: Bool.True } else c)) }
+		_ => table
+	}
+
+create_function : Node.CreateFunctionStmt -> Catalog.Function
+create_function = |f| {
+	params = f.parameters.keep_oks(
+		|p|
+			match p {
+				FunctionParameter(param) => Ok(param)
+				_ => Err(NotAParameter)
+			},
+	)
+	# IN, INOUT, VARIADIC and the default mode take an argument. OUT, INOUT
+	# and TABLE give a column.
+	inputs = params.keep_if(|p| [105, 98, 118, 100].contains(p.mode))
+	outputs = params.keep_if(|p| [111, 98, 116].contains(p.mode)).map(|p| { name: p.name ?? "", type: Catalog.type_name(p.arg_type) })
+	declared = Catalog.type_name(f.return_type)
+	result =
+		match outputs {
+			[] => declared
+			[only] => only.type
+			_ => "record"
+		}
+	set =
+		match f.return_type {
+			TypeName(t) => t.setof
+			_ => Bool.False
+		}
+	strict = f.options.any(
+		|o|
+			match o {
+				DefElem(d) =>
+					if d.defname == Ok("strict") {
+						match d.arg {
+							Boolean(b) => b.boolval
+							_ => Bool.False
+						}
+					} else {
+						Bool.False
+					}
+				_ => Bool.False
+			},
+	)
+	{
+		name: names_of(f.funcname).last() ?? "",
+		args: inputs.map(|p| Catalog.type_name(p.arg_type)),
+		defaults: inputs.count_if(|p| p.defexpr != Null),
+		variadic: inputs.any(|p| p.mode == 118),
+		result,
+		set,
+		strict,
+		outputs: if outputs.len() > 1 outputs else [],
+	}
+}
+
+names_of : List(Node) -> List(Str)
+names_of = |nodes|
+	nodes.keep_oks(
+		|node|
+			match node {
+				String(s) =>
+					match s.sval {
+						Ok(text) => Ok(text)
+						Err(_) => Err(NotAString)
+					}
+				_ => Err(NotAString)
+			},
+	)
+
+sample =
+	\\\\restrict abc123
+	\\CREATE TYPE public.access_level AS ENUM (
+	\\    'Viewer',
+	\\    'Editor'
+	\\);
+	\\CREATE DOMAIN public.email AS text NOT NULL CHECK (VALUE ~ '@');
+	\\CREATE TABLE public.students (
+	\\    id integer NOT NULL,
+	\\    nickname text NOT NULL COLLATE public.nocase,
+	\\    avatar_url text,
+	\\    "group" integer,
+	\\    handle character varying(255) DEFAULT ''::character varying NOT NULL,
+	\\    seen_at timestamp(6) without time zone,
+	\\    level public.access_level,
+	\\    tags text[],
+	\\    contact public.email,
+	\\    CONSTRAINT students_x CHECK ((id <> 0))
+	\\);
+	\\CREATE TABLE public.schools (
+	\\    code text,
+	\\    name text NOT NULL
+	\\);
+	\\CREATE SEQUENCE public.schools_id_seq START WITH 1;
+	\\ALTER TABLE ONLY public.schools
+	\\    ADD CONSTRAINT schools_pkey PRIMARY KEY (code);
+	\\ALTER TABLE ONLY public.schools ALTER COLUMN code SET DEFAULT 'x';
+	\\CREATE VIEW public.active_students AS SELECT * FROM public.students;
+	\\CREATE FUNCTION public.full_name(first text, last text DEFAULT '') RETURNS text
+	\\    LANGUAGE sql STRICT
+	\\    AS $$ select first || ' ' || last $$;
+	\\CREATE FUNCTION public.school_stats(code text, OUT n bigint, OUT newest timestamp with time zone) RETURNS record
+	\\    LANGUAGE sql AS $$ select 1, now() $$;
+	\\\\unrestrict abc123
+
+expect {
+	catalog = Catalog.parse(sample) ?? Catalog.empty
+	catalog.enums() == ["access_level"]
+	and catalog.enum_labels("access_level") == Ok(["Viewer", "Editor"])
+	and catalog.table("students").map_ok(|t| t.columns)
+	== Ok(
+		Known(
+			[
+				{ name: "id", type: "integer", not_null: Bool.True, has_default: Bool.False },
+				{ name: "nickname", type: "text", not_null: Bool.True, has_default: Bool.False },
+				{ name: "avatar_url", type: "text", not_null: Bool.False, has_default: Bool.False },
+				{ name: "group", type: "integer", not_null: Bool.False, has_default: Bool.False },
+				{ name: "handle", type: "character varying", not_null: Bool.True, has_default: Bool.True },
+				{ name: "seen_at", type: "timestamp without time zone", not_null: Bool.False, has_default: Bool.False },
+				{ name: "level", type: "access_level", not_null: Bool.False, has_default: Bool.False },
+				{ name: "tags", type: "text[]", not_null: Bool.False, has_default: Bool.False },
+				{ name: "contact", type: "text", not_null: Bool.True, has_default: Bool.False },
+			],
+		),
+	)
+	and catalog.table("schools").map_ok(|t| (t.columns, t.primary_key)) == Ok((Known([{ name: "code", type: "text", not_null: Bool.True, has_default: Bool.True }, { name: "name", type: "text", not_null: Bool.True, has_default: Bool.False }]), ["code"]))
+}
+
+expect {
+	catalog = Catalog.parse(sample) ?? Catalog.empty
+	match catalog.table("active_students") {
+		Ok({ columns: View(_), .. }) => Bool.True
+		_ => Bool.False
+	}
+}
+
+expect {
+	catalog = Catalog.parse(sample) ?? Catalog.empty
+	catalog.functions()
+	== [
+		{ name: "full_name", args: ["text", "text"], defaults: 1, variadic: Bool.False, result: "text", set: Bool.False, strict: Bool.True, outputs: [] },
+		{ name: "school_stats", args: ["text"], defaults: 0, variadic: Bool.False, result: "record", set: Bool.False, strict: Bool.False, outputs: [{ name: "n", type: "bigint" }, { name: "newest", type: "timestamp with time zone" }] },
+	]
+}
+
+expect {
+	dump =
+		\\CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;
+		\\CREATE EXTENSION IF NOT EXISTS plpgsql WITH SCHEMA pg_catalog;
+		\\CREATE TABLE public.events (id bigint NOT NULL, at timestamp with time zone DEFAULT now() NOT NULL, n integer GENERATED ALWAYS AS (1) STORED);
+		\\ALTER TABLE public.events ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME public.events_id_seq START WITH 1);
+		\\CREATE TRIGGER stamp BEFORE INSERT ON public.events FOR EACH ROW EXECUTE FUNCTION public.stamp();
+	catalog = Catalog.parse(dump) ?? Catalog.empty
+	catalog.extensions() == ["pgcrypto"]
+	and catalog.table("events").map_ok(|t| (t.columns, t.triggers))
+	== Ok(
+		(
+			Known(
+				[
+					{ name: "id", type: "bigint", not_null: Bool.True, has_default: Bool.True },
+					{ name: "at", type: "timestamp with time zone", not_null: Bool.True, has_default: Bool.True },
+					{ name: "n", type: "integer", not_null: Bool.False, has_default: Bool.True },
+				],
+			),
+			Bool.True,
+		),
+	)
+}

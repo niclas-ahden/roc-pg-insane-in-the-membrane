@@ -63,9 +63,9 @@ echo! = |{ host, port, user, database }, number| {
 		user,
 		database,
 		auth: NoAuth,
-		params: [("application_name", "roc-pg-concurrent")],
+		params: [("application_name", "roc-pg-insane-in-the-membrane-concurrent")],
 	})?
-	answer = client.query_one!(
+	answer = client.query_one_unchecked!(
 		"select $1::int as n, pg_backend_pid() as pid, pg_sleep(0.02)",
 		[Param.i32(number)],
 		|row| Ok({ n: row.i32("n")?, pid: row.i32("pid")? }),

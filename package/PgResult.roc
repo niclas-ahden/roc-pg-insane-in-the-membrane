@@ -10,7 +10,8 @@
 ## })?
 ## ```
 ##
-## `client.query!` and `client.query_one!` run and decode in one call.
+## `client.query_unchecked!` and the other query functions run and decode
+## in one call.
 PgResult :: {
 	columns : List(Str),
 	raw_rows : List(List([Null, Present(List(U8))])),
@@ -267,6 +268,16 @@ PgResult :: {
 	## ```
 	new : List(Str), List(List([Null, Present(List(U8))])), Str -> PgResult
 	new = |columns, raw_rows, command_tag| { columns, raw_rows, command_tag }
+
+	## The rows as the server sent them: `Null` or the text of each value, in
+	## column order. Checked queries decode them with their row type.
+	rows : PgResult -> List(List([Null, Present(List(U8))]))
+	rows = |result| result.raw_rows
+
+	## The elements of a one-dimensional array in Postgres text form, such as
+	## `{a,"b c",NULL}`.
+	array_elements : Str -> Try(List([Null, Present(Str)]), [InvalidArray])
+	array_elements = |text| parse_array(text)
 
 	## How many rows the command returned.
 	len : PgResult -> U64

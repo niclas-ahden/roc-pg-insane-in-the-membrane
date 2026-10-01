@@ -23,3 +23,7 @@ generated-docs/
 
 # Scratch files of the concurrency test in tests.roc
 .concurrent-test/
+
+# Local only, never committed: Postgres source, libpg_query, the oracle and
+# its output
+local/

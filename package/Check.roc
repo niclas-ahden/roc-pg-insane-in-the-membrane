@@ -1,0 +1,2094 @@
+## Reads a query's parse tree and checks it against a [Catalog]: that its
+## tables and columns exist, that parameters fit the columns they meet, and
+## what its result columns are called, what type they have and whether they
+## can be NULL.
+##
+## It never rejects what it does not understand. An expression it cannot
+## type is "unknown", a relation it cannot read makes its columns unknown,
+## and unknown things are not checked. Only what it is sure of becomes a
+## problem.
+import Catalog
+import Overload
+import Lex
+import Node
+import Parse
+
+Check :: [].{
+	## A result column. `nullable` is `Yes` when the column can be NULL,
+	## `No` when it cannot, and `Unknown` when the analysis cannot tell.
+	Output : { name : Str, type : [Known(Str), Unknown], nullable : [Yes, No, Unknown] }
+
+	Result : { outputs : [Known(List(Check.Output)), Unknown], problems : List(Str) }
+
+	## A field of the parameter record, like a `RowFormat.Field`: `kind` is
+	## `Str`, `I32`, `List(I32)` and so on, and `nullable` is whether it is a
+	## `Try(_, [Null])`.
+	Param : { name : Str, kind : Str, nullable : Bool }
+
+	## Analyze one statement: a node of [Parse.parse] over the text
+	## [Lex.grammar_text] makes. `params` are the fields of the parameter
+	## record, and `names` says which `$name` stands at each parameter's
+	## location ([Lex.named_at]).
+	##
+	## A parameter is checked against the column it meets: `col = $name`,
+	## `col in ($a, $b)`, `col = any($names)`, `set col = $name` and the
+	## values of an `insert`. It must fit the column's type, and one that can
+	## be NULL cannot go into a `NOT NULL` column.
+	analyze : Node, Catalog, List(Check.Param), List({ at : I64, name : Str }) -> Check.Result
+	analyze = |stmt, catalog, params, names| {
+		result = statement(stmt, { catalog, ctes: [], outer: [], params, names, grouped: Bool.False, enums: catalog.enums() })
+		{ ..result, problems: result.problems.fold([], |acc, p| if acc.contains(p) acc else acc.append(p)) }
+	}
+
+	## The name of a built in Postgres type, from its OID as a result
+	## description reports it.
+	oid_type : I32 -> Try(Str, [UnknownOid])
+	oid_type = |oid|
+		match oid {
+			16 => Ok("boolean")
+			17 => Ok("bytea")
+			20 => Ok("bigint")
+			21 => Ok("smallint")
+			23 => Ok("integer")
+			25 => Ok("text")
+			114 => Ok("json")
+			700 => Ok("real")
+			701 => Ok("double precision")
+			869 => Ok("inet")
+			1000 => Ok("boolean[]")
+			1005 => Ok("smallint[]")
+			1007 => Ok("integer[]")
+			1009 => Ok("text[]")
+			1015 => Ok("character varying[]")
+			1016 => Ok("bigint[]")
+			1021 => Ok("real[]")
+			1022 => Ok("double precision[]")
+			1042 => Ok("character")
+			1043 => Ok("character varying")
+			1082 => Ok("date")
+			1083 => Ok("time without time zone")
+			1114 => Ok("timestamp without time zone")
+			1184 => Ok("timestamp with time zone")
+			1231 => Ok("numeric[]")
+			1700 => Ok("numeric")
+			2950 => Ok("uuid")
+			3802 => Ok("jsonb")
+			_ => Err(UnknownOid)
+		}
+
+	## Whether a column of Postgres type `type` fits a record field that
+	## decodes as `kind` (a `RowFormat.Field` kind). Types and kinds this does not
+	## know always fit.
+	compatible : Str, Str -> Bool
+	compatible = |type, kind|
+		if kind == "Str" or kind == "" {
+			Bool.True
+		} else if type.ends_with("[]") {
+			if kind.starts_with("List(") {
+				Check.compatible(type.drop_suffix("[]"), kind.drop_prefix("List(").drop_suffix(")"))
+			} else {
+				Bool.False
+			}
+		} else if kind.starts_with("List(") {
+			!known_type(type)
+		} else {
+			match allowed_types(kind) {
+				Ok(allowed) => !known_type(type) or allowed.contains(type)
+				Err(_) => Bool.True
+			}
+		}
+
+	## A hint for a name that is probably a misspelling of one of `names`,
+	## such as `` (did you mean `school_id`?)``, or "" when none is close.
+	suggestion : Str, List(Str) -> Str
+	suggestion = |name, names| {
+		limit = if name.to_utf8().len() <= 4 1 else 2
+		var $best = ""
+		var $best_distance = limit + 1
+		for candidate in names {
+			d = distance(name, candidate)
+			if d < $best_distance and candidate != name {
+				$best = candidate
+				$best_distance = d
+			}
+		}
+		if $best == "" "" else " (did you mean `${$best}`?)"
+	}
+}
+
+## How many single byte edits (insert, delete, replace, swap two neighbours)
+## turn `a_str` into `b_str`.
+distance : Str, Str -> U64
+distance = |a_str, b_str| {
+	a = a_str.to_utf8()
+	b = b_str.to_utf8()
+	var $prev2 = []
+	var $prev = []
+	var $j = 0
+	while $j <= b.len() {
+		$prev = $prev.append($j)
+		$j = $j + 1
+	}
+	var $i = 1
+	while $i <= a.len() {
+		ca = a.get($i - 1) ?? 0
+		var $cur = [$i]
+		var $k = 1
+		while $k <= b.len() {
+			cb = b.get($k - 1) ?? 0
+			cost = if ca == cb 0 else 1
+			edit = smaller(smaller(($prev.get($k) ?? 0) + 1, ($cur.get($k - 1) ?? 0) + 1), ($prev.get($k - 1) ?? 0) + cost)
+			swapped = $i > 1 and $k > 1 and ca == (b.get($k - 2) ?? 0) and (a.get($i - 2) ?? 0) == cb
+			$cur = $cur.append(if swapped smaller(edit, ($prev2.get($k - 2) ?? 0) + 1) else edit)
+			$k = $k + 1
+		}
+		$prev2 = $prev
+		$prev = $cur
+		$i = $i + 1
+	}
+	$prev.get(b.len()) ?? 0
+}
+
+smaller : U64, U64 -> U64
+smaller = |x, y| if x < y x else y
+
+Cols : [Known(List(Check.Output)), Unknown]
+
+## `grouped` is whether the select being read has a `group by`, which
+## decides whether an aggregate can see no rows. `enums` are the schema's
+## enum types.
+Env : { catalog : Catalog, ctes : List({ name : Str, columns : Cols }), outer : List(Rel), params : List(Check.Param), names : List({ at : I64, name : Str }), grouped : Bool, enums : List(Str) }
+
+## A relation of a query. `hidden` are the columns an unqualified reference
+## does not see, because a `using` or `natural` join merged them into the
+## same column of the other side.
+## `not_null` are the columns a `where` clause keeps only rows where they
+## are not NULL.
+Rel : { alias : Str, table : Str, columns : Cols, nullable : Bool, hidden : List(Str), not_null : List(Str) }
+
+Lookup : [Found(Check.Output), Missing(Str), Unsure]
+
+no_outputs : Check.Result
+no_outputs = { outputs: Unknown, problems: [] }
+
+int2 = ["smallint", "int2", "smallserial"]
+int4 = ["integer", "int", "int4", "serial"]
+int8 = ["bigint", "int8", "bigserial"]
+numeric = ["numeric", "decimal"]
+float4 = ["real", "float4"]
+float8 = ["double precision", "float8", "float"]
+booleans = ["boolean", "bool"]
+texts = ["text", "character varying", "varchar", "character", "char", "bpchar", "name", "citext", "uuid", "date", "time without time zone", "time with time zone", "time", "timetz", "timestamp without time zone", "timestamp with time zone", "timestamp", "timestamptz", "interval", "json", "jsonb", "inet", "cidr", "macaddr", "bytea", "xml", "tsvector", "money"]
+
+known_type : Str -> Bool
+known_type = |type| [int2, int4, int8, numeric, float4, float8, booleans, texts].any(|group| group.contains(type))
+
+allowed_types : Str -> Try(List(Str), [NoRule])
+allowed_types = |kind|
+	match kind {
+		"Bool" => Ok(booleans)
+		"I8" | "I16" | "U8" | "U16" => Ok(int2.concat(int4))
+		"I32" => Ok(int2.concat(int4))
+		"U32" | "I64" | "U64" => Ok(int2.concat(int4).concat(int8))
+		"Dec" => Ok(int2.concat(int4).concat(int8).concat(numeric))
+		"F32" => Ok(float4)
+		"F64" => Ok(float4.concat(float8))
+		_ => Err(NoRule)
+	}
+
+statement : Node, Env -> Check.Result
+statement = |node, env|
+	match node {
+		RawStmt(raw) => statement(raw.stmt, env)
+		SelectStmt(s) => select_stmt(s, env)
+		InsertStmt(s) => insert_stmt(s, env)
+		UpdateStmt(s) => update_stmt(s, env)
+		DeleteStmt(s) => delete_stmt(s, env)
+		MergeStmt(s) => merge_stmt(s, env)
+		_ => no_outputs
+	}
+
+## The common table expressions of a `with` clause, added to `env`.
+with_env : Node, Env -> { env : Env, problems : List(Str) }
+with_env = |node, env|
+	match node {
+		WithClause(w) => {
+			var $env = env
+			var $problems = []
+			for item in w.ctes {
+				match item {
+					CommonTableExpr(cte) => {
+						name = cte.ctename ?? ""
+						# A recursive query reads itself, so it is known before its body is.
+						self_env = { ..$env, ctes: $env.ctes.append({ name, columns: Unknown }) }
+						result = statement(cte.ctequery, self_env)
+						$env = { ..$env, ctes: $env.ctes.append({ name, columns: rename(result.outputs, names_of(cte.aliascolnames)) }) }
+						$problems = $problems.concat(result.problems)
+					}
+					_ => {}
+				}
+			}
+			{ env: $env, problems: $problems }
+		}
+		_ => { env, problems: [] }
+	}
+
+## Give outputs the names of a column alias list, by position.
+rename : Cols, List(Str) -> Cols
+rename = |outputs, aliases|
+	if aliases.is_empty() {
+		outputs
+	} else {
+		match outputs {
+			Known(list) => Known(list.map_with_index(|o, i| { ..o, name: aliases.get(i) ?? o.name }))
+			Unknown => Known(aliases.map(|name| { name, type: Unknown, nullable: Unknown }))
+		}
+	}
+
+select_stmt : Node.SelectStmt, Env -> Check.Result
+select_stmt = |s, env| {
+	{ env: inner, problems: with_problems } = with_env(s.with_clause, env)
+	result =
+		if s.op != 0 {
+			set_operation(s, inner)
+		} else if !s.values_lists.is_empty() {
+			values_select(s.values_lists, inner)
+		} else {
+			simple_select(s, inner)
+		}
+	{ ..result, problems: with_problems.concat(result.problems) }
+}
+
+## Selects joined by `union`, `intersect` or `except`. The columns are named
+## after the first one, and can be NULL when they can in any of them.
+set_operation : Node.SelectStmt, Env -> Check.Result
+set_operation = |s, env| {
+	results = set_branches(s).map(|branch| select_stmt(branch, env))
+	problems = results.fold([], |acc, r| acc.concat(r.problems))
+	outputs =
+		match results.first() {
+			Ok(first) =>
+				match first.outputs {
+					Known(list) => Known(list.map_with_index(|o, i| { ..o, nullable: merge_nullable(results.map(|r| output_at(r.outputs, i))) }))
+					Unknown => Unknown
+				}
+			Err(_) => Unknown
+		}
+	{ outputs, problems }
+}
+
+set_branches : Node.SelectStmt -> List(Node.SelectStmt)
+set_branches = |s|
+	if s.op == 0 {
+		[s]
+	} else {
+		branch_list(s.larg).concat(branch_list(s.rarg))
+	}
+
+branch_list : Node -> List(Node.SelectStmt)
+branch_list = |node|
+	match node {
+		SelectStmt(inner) => set_branches(inner)
+		_ => []
+	}
+
+## `Yes` when any can be NULL, `No` when none can.
+merge_nullable : List([Yes, No, Unknown]) -> [Yes, No, Unknown]
+merge_nullable = |all|
+	if all.any(|n| n == Yes) {
+		Yes
+	} else if all.all(|n| n == No) {
+		No
+	} else {
+		Unknown
+	}
+
+output_at : Cols, U64 -> [Yes, No, Unknown]
+output_at = |outputs, i|
+	match outputs {
+		Known(list) =>
+			match list.get(i) {
+				Ok(o) => o.nullable
+				Err(_) => Unknown
+			}
+		Unknown => Unknown
+	}
+
+## `values (...), ...`, whose columns are `column1`, `column2`, ...
+values_select : List(Node), Env -> Check.Result
+values_select = |lists, env| {
+	rows = lists.map(
+		|row|
+			match row {
+				NodeList(items) => items
+				_ => []
+			},
+	)
+	problems = rows.fold([], |acc, items| items.fold(acc, |inner, item| inner.concat(expression_problems(item, [], env))))
+	outputs =
+		match rows.first() {
+			Ok(first) =>
+				Known(
+					first.map_with_index(
+						|item, i| {
+							output = expr_output(item, [], env)
+							nullable = merge_nullable(rows.map(|row| row.get(i).map_ok(|cell| expr_output(cell, [], env).nullable) ?? Unknown))
+							{ ..output, name: "column${(i + 1).to_str()}", nullable }
+						},
+					),
+				)
+			Err(_) => Unknown
+		}
+	{ outputs, problems }
+}
+
+simple_select : Node.SelectStmt, Env -> Check.Result
+simple_select = |s, outer_env| {
+	{ rels, problems: from_problems } = from_list(s.from_clause, { ..outer_env, grouped: Bool.False })
+	env = { ..outer_env, grouped: !s.group_clause.is_empty() }
+	# The rows `where` keeps have no NULL in the columns it rules NULL out.
+	{ outputs, problems: target_problems } = target_list(s.target_list, narrowed(rels, s.where_clause), env)
+	aliases = s.target_list.keep_oks(
+		|target|
+			match target {
+				ResTarget(t) => t.name.map_err(|_| NoAlias)
+				_ => Err(NoAlias)
+			},
+	)
+	clause_problems =
+		expression_problems(s.where_clause, rels, env)
+			.concat(s.group_clause.fold([], |acc, item| acc.concat(output_ref_problems(item, aliases, rels, env))))
+			.concat(expression_problems(s.having_clause, rels, env))
+			.concat(s.distinct_clause.fold([], |acc, item| acc.concat(output_ref_problems(item, aliases, rels, env))))
+			.concat(s.sort_clause.fold([], |acc, item| acc.concat(output_ref_problems(item, aliases, rels, env))))
+			.concat(s.window_clause.fold([], |acc, item| acc.concat(expression_problems(item, rels, env))))
+			.concat(expression_problems(s.limit_count, rels, env))
+			.concat(expression_problems(s.limit_offset, rels, env))
+	{ outputs, problems: from_problems.concat(target_problems).concat(clause_problems).concat(group_problems(s, rels, env)) }
+}
+
+## The sub-expressions of an expression, not looking into subqueries.
+expr_children : Node -> List(Node)
+expr_children = |node|
+	match node {
+		AExpr(a) => [a.lexpr, a.rexpr]
+		BoolExpr(b) => b.args
+		NodeList(items) => items
+		FuncCall(f) => f.args.concat(f.agg_order).concat([f.agg_filter, f.over])
+		NamedArgExpr(n) => [n.arg]
+		TypeCast(t) => [t.arg]
+		CollateClause(c) => [c.arg]
+		NullTest(t) => [t.arg]
+		BooleanTest(t) => [t.arg]
+		CoalesceExpr(c) => c.args
+		MinMaxExpr(m) => m.args
+		CaseExpr(c) => [c.arg, c.defresult].concat(c.args)
+		CaseWhen(w) => [w.expr, w.result]
+		AArrayExpr(a) => a.elements
+		RowExpr(r) => r.args
+		AIndirection(i) => [i.arg].concat(i.indirection)
+		AIndices(i) => [i.lidx, i.uidx]
+		SortBy(s) => [s.node]
+		WindowDef(w) => w.partition_clause.concat(w.order_clause)
+		ResTarget(t) => [t.val]
+		_ => []
+	}
+
+## Whether `node` is a call of an aggregate, not over a window.
+is_aggregate_call : Node, List(Rel), Env -> Bool
+is_aggregate_call = |node, rels, env|
+	match node {
+		FuncCall(f) if f.over == Null =>
+			match function_choice(f, rels, env) {
+				Ok({ kind: Aggregate, .. }) => Bool.True
+				_ => Bool.False
+			}
+		_ => Bool.False
+	}
+
+## Whether an expression calls an aggregate outside a subquery.
+has_aggregate : Node, List(Rel), Env -> Bool
+has_aggregate = |node, rels, env| is_aggregate_call(node, rels, env) or expr_children(node).any(|child| has_aggregate(child, rels, env))
+
+## The relation of this query a column reference reads, if it reads one.
+owner : Ref, List(Rel) -> Try(Rel, [NotOwned])
+owner = |ref, rels|
+	match ref.qualifier {
+		Some(alias) =>
+			match find_rel(rels, alias) {
+				Ok(rel) => Ok(rel)
+				Err(_) => Err(NotOwned)
+			}
+		None =>
+			match rels.keep_if(|r| visible_names(r).contains(ref.name)) {
+				[one] => Ok(one)
+				_ => Err(NotOwned)
+			}
+	}
+
+## A select that groups, by `group by` or by calling an aggregate, reads a
+## column outside an aggregate only when it is grouped by, or its table's
+## primary key is, or the whole expression it is in is. Grouping sets, and
+## calls of functions this does not know (they could be aggregates), are
+## left to the server.
+group_problems : Node.SelectStmt, List(Rel), Env -> List(Str)
+group_problems = |s, rels, env| {
+	simple_items =
+		s.group_clause.all(
+			|item|
+				match item {
+					GroupingSet(_) => Bool.False
+					_ => Bool.True
+				},
+		)
+	grouped = !s.group_clause.is_empty() or s.target_list.any(|t| has_aggregate(t, rels, env)) or has_aggregate(s.having_clause, rels, env)
+	if !simple_items or !grouped {
+		[]
+	} else {
+		selected = s.target_list.keep_oks(
+			|t|
+				match t {
+					ResTarget(r) => Ok(r)
+					_ => Err(NotATarget)
+				},
+		)
+		# A position or an output alias in `group by` means that select item.
+		group_exprs = s.group_clause.map(
+			|item|
+				match item {
+					AConst({ val: Integer(i), .. }) => (selected.get((i.ival - 1).to_u64_wrap()) ?? { name: Err(Null), indirection: [], val: item, location: 0 }).val
+					ColumnRef({ fields: [String({ sval: Ok(name) })], .. }) =>
+						match selected.find_first(|t| t.name == Ok(name)) {
+							Ok(t) if !has_column_named(rels, name) => t.val
+							_ => item
+						}
+					_ => item
+				},
+		)
+		keys = group_exprs.keep_oks(
+			|g|
+				match g {
+					ColumnRef(c) =>
+						match column_ref(c) {
+							Ok(ref) =>
+								match owner(ref, rels) {
+									Ok(r) => Ok((r.alias, ref.name))
+									Err(_) => Err(NotOwned)
+								}
+							Err(_) => Err(NotOwned)
+						}
+					_ => Err(NotOwned)
+				},
+		)
+		covered = rels.keep_if(
+			|r|
+				match env.catalog.table(r.table) {
+					Ok(table) if !table.primary_key.is_empty() and r.columns != Unknown => table.primary_key.all(|col| keys.contains((r.alias, col)))
+					_ => Bool.False
+				},
+		).map(|r| r.alias)
+		ungrouped = |node|
+			ungrouped_refs(node, group_exprs, keys, covered, rels, env)
+		aliases = selected.keep_oks(|t| t.name.map_err(|_| NoAlias))
+		sorted = s.sort_clause.concat(s.distinct_clause).fold(
+			[],
+			|acc, item|
+				match item {
+					SortBy({ node: AConst(_), .. }) => acc
+					SortBy({ node: ColumnRef({ fields: [String({ sval: Ok(name) })], .. }), .. }) if aliases.contains(name) => acc
+					other => acc.concat(ungrouped(other))
+				},
+		)
+		refs = selected.fold([], |acc, t| acc.concat(ungrouped(t.val))).concat(ungrouped(s.having_clause)).concat(sorted)
+		refs.map(|ref| "column `${ref}` must appear in `group by` or be used in an aggregate")
+	}
+}
+
+has_column_named : List(Rel), Str -> Bool
+has_column_named = |rels, name| rels.any(|r| visible_names(r).contains(name))
+
+## The column references in `node` that grouping does not allow, as
+## written.
+ungrouped_refs : Node, List(Node), List((Str, Str)), List(Str), List(Rel), Env -> List(Str)
+ungrouped_refs = |node, group_exprs, keys, covered, rels, env|
+	if group_exprs.any(|g| Node.equal(g, node)) {
+		[]
+	} else {
+		match node {
+			ColumnRef(c) =>
+				match column_ref(c) {
+					Ok(ref) =>
+						match owner(ref, rels) {
+							Ok(rel) if !keys.contains((rel.alias, ref.name)) and !covered.contains(rel.alias) =>
+								match ref.qualifier {
+									Some(q) => ["${q}.${ref.name}"]
+									None => [ref.name]
+								}
+							_ => []
+						}
+					Err(_) => []
+				}
+			FuncCall(f) =>
+				if is_aggregate_call(node, rels, env) {
+					[]
+				} else {
+					match function_choice(f, rels, env) {
+						# A function this does not know could be an aggregate.
+						Err(_) => []
+						Ok(_) => expr_children(node).fold([], |acc, child| acc.concat(ungrouped_refs(child, group_exprs, keys, covered, rels, env)))
+					}
+				}
+			SubLink(_) => []
+			GroupingFunc(_) => []
+			_ => expr_children(node).fold([], |acc, child| acc.concat(ungrouped_refs(child, group_exprs, keys, covered, rels, env)))
+		}
+	}
+
+## Problems of an `order by`, `group by` or `distinct on` item, which may
+## also name an output column by its alias.
+output_ref_problems : Node, List(Str), List(Rel), Env -> List(Str)
+output_ref_problems = |item, aliases, rels, env| {
+	inner =
+		match item {
+			SortBy(sort) => sort.node
+			_ => item
+		}
+	match inner {
+		ColumnRef(c) =>
+			match c.fields {
+				[only] if aliases.contains(string_of(only) ?? "") => []
+				_ => expression_problems(inner, rels, env)
+			}
+		_ => expression_problems(inner, rels, env)
+	}
+}
+
+## The relations of a `from` list.
+from_list : List(Node), Env -> { rels : List(Rel), problems : List(Str) }
+from_list = |items, env| {
+	var $rels = []
+	var $problems = []
+	for item in items {
+		# A lateral item can read the relations before it.
+		{ rels, problems } = from_item(item, { ..env, outer: $rels.concat(env.outer) })
+		$rels = $rels.concat(rels)
+		$problems = $problems.concat(problems)
+	}
+	{ rels: $rels, problems: $problems }
+}
+
+from_item : Node, Env -> { rels : List(Rel), problems : List(Str) }
+from_item = |node, env|
+	match node {
+		RangeVar(r) => {
+			name = r.relname ?? ""
+			{ columns, problems } = table_columns(name, env, is_set(r.schemaname))
+			{ rels: [aliased(name, columns, r.alias)], problems }
+		}
+		RangeSubselect(r) => {
+			result = statement(r.subquery, env)
+			{ rels: [aliased("(subquery)", result.outputs, r.alias)], problems: result.problems }
+		}
+		RangeFunction(r) => {
+			calls = r.functions.fold(
+				[],
+				|acc, f|
+					match f {
+						NodeList(parts) => acc.concat(parts.take_first(1))
+						_ => acc
+					},
+			)
+			name =
+				match calls.first() {
+					Ok(FuncCall(call)) => names_of(call.funcname).last() ?? "?"
+					_ => "?"
+				}
+			problems = calls.fold([], |acc, call| acc.concat(expression_problems(call, [], env)))
+			# One function that returns a type of one column gives one column,
+			# named after the alias, or the function without one.
+			columns =
+				match calls {
+					[FuncCall(call)] if !r.ordinality =>
+						match function_choice(call, [], env) {
+							Ok({ outputs: [_, ..] as outputs, .. }) => Known(outputs.map(|o| { name: o.name, type: Known(o.type), nullable: Unknown }))
+							Ok({ result: Known(type), .. }) if Overload.category(type, env.enums) != 'C' => {
+								column =
+									match r.alias {
+										Alias(a) => a.aliasname ?? name
+										_ => name
+									}
+								Known([{ name: column, type: Known(type), nullable: Unknown }])
+							}
+							_ => Unknown
+						}
+					_ => Unknown
+				}
+			{ rels: [aliased(name, columns, r.alias)], problems }
+		}
+		JoinExpr(j) => join(j, env)
+		_ => { rels: [], problems: [] }
+	}
+
+## A relation named `table`, or after its alias, with the alias's column
+## names.
+aliased : Str, Cols, Node -> Rel
+aliased = |table, columns, alias|
+	match alias {
+		Alias(a) => { alias: a.aliasname ?? table, table, columns: rename(columns, names_of(a.colnames)), nullable: Bool.False, hidden: [], not_null: [] }
+		_ => { alias: table, table, columns, nullable: Bool.False, hidden: [], not_null: [] }
+	}
+
+## Both sides of a join, marked NULL where an outer join can make them so.
+join : Node.JoinExpr, Env -> { rels : List(Rel), problems : List(Str) }
+join = |j, env| {
+	left = from_item(j.larg, env)
+	right = from_item(j.rarg, { ..env, outer: left.rels.concat(env.outer) })
+	merged =
+		if j.is_natural {
+			left_names = left.rels.fold([], |acc, r| acc.concat(visible_names(r)))
+			right.rels.fold([], |acc, r| acc.concat(visible_names(r))).keep_if(|n| left_names.contains(n))
+		} else {
+			names_of(j.using_clause)
+		}
+	hide = |rels| rels.map(|r| { ..r, hidden: r.hidden.concat(merged) })
+	nulled = |rels| rels.map(|r| { ..r, nullable: Bool.True })
+	# A merged column is the right side's in a right join, the left side's
+	# otherwise.
+	rels =
+		match j.jointype {
+			1 => left.rels.concat(nulled(hide(right.rels)))
+			2 => nulled(left.rels).concat(nulled(hide(right.rels)))
+			3 => nulled(hide(left.rels)).concat(right.rels)
+			_ => left.rels.concat(hide(right.rels))
+		}
+	problems = left.problems.concat(right.problems).concat(expression_problems(j.quals, rels, env))
+	{ rels, problems }
+}
+
+## A table's columns from the query's CTEs or the catalog. An unknown name is
+## a problem only when the catalog has tables to compare with.
+table_columns : Str, Env, Bool -> { columns : Cols, problems : List(Str) }
+table_columns = |name, env, qualified| {
+	cte = if qualified Err(NotFound) else env.ctes.find_first(|c| c.name == name)
+	match cte {
+		Ok(found) => { columns: found.columns, problems: [] }
+		Err(_) =>
+			match env.catalog.table(name) {
+				Ok(table) =>
+					match table.columns {
+						Known(columns) => { columns: Known(columns.map(|c| { name: c.name, type: Known(c.type), nullable: if c.not_null No else Yes })), problems: [] }
+						View(view) => {
+							# A view's columns are what its query returns. Problems inside it
+							# are not this query's.
+							result = statement(view.query, { ..env, ctes: [], outer: [], params: [], grouped: Bool.False })
+							{ columns: rename(result.outputs, view.aliases), problems: [] }
+						}
+						Unknown => { columns: Unknown, problems: [] }
+					}
+				Err(_) =>
+					if env.catalog.is_empty() {
+						{ columns: Unknown, problems: [] }
+					} else {
+						{ columns: Unknown, problems: ["table `${name}` does not exist in the schema${Check.suggestion(name, env.catalog.tables().map(|t| t.name).concat(env.ctes.map(|c| c.name)))}"] }
+					}
+			}
+	}
+}
+
+## The outputs of a select or `returning` list.
+target_list : List(Node), List(Rel), Env -> { outputs : Cols, problems : List(Str) }
+target_list = |items, rels, env| {
+	var $outputs = Known([])
+	var $problems = []
+	for target in items {
+		{ outputs, problems } = target_item(target, rels, env)
+		$problems = $problems.concat(problems)
+		$outputs =
+			match ($outputs, outputs) {
+				(Known(so_far), Known(more)) => Known(so_far.concat(more))
+				_ => Unknown
+			}
+	}
+	{ outputs: $outputs, problems: $problems }
+}
+
+## One item of a select list, which `*` and `alias.*` expand into many.
+target_item : Node, List(Rel), Env -> { outputs : Cols, problems : List(Str) }
+target_item = |target, rels, env|
+	match target {
+		ResTarget(t) =>
+			match star_of(t.val) {
+				Ok(AllRels) => {
+					all = rels.map(rel_outputs)
+					if all.all(|o| o != Unknown) {
+						{ outputs: Known(all.fold([], |acc, o| acc.concat(known_list(o)))), problems: [] }
+					} else {
+						{ outputs: Unknown, problems: [] }
+					}
+				}
+				Ok(OneRel(alias)) =>
+					match find_rel(rels.concat(env.outer), alias) {
+						Ok(rel) => { outputs: rel_outputs(rel), problems: [] }
+						Err(_) => { outputs: Unknown, problems: ["`${alias}.*` names no table of the query"] }
+					}
+				Err(_) => {
+					output = expr_output(t.val, rels, env)
+					named =
+						match t.name {
+							Ok(name) => { ..output, name }
+							Err(_) => output
+						}
+					{ outputs: Known([named]), problems: expression_problems(t.val, rels, env) }
+				}
+			}
+		_ => { outputs: Unknown, problems: [] }
+	}
+
+## `*` for every relation, or `alias.*` for one.
+star_of : Node -> Try([AllRels, OneRel(Str)], [NotAStar])
+star_of = |node|
+	match node {
+		ColumnRef(c) =>
+			match c.fields {
+				[AStar(_)] => Ok(AllRels)
+				[.., qualifier, AStar(_)] =>
+					match string_of(qualifier) {
+						Ok(alias) => Ok(OneRel(alias))
+						Err(_) => Err(NotAStar)
+					}
+				_ => Err(NotAStar)
+			}
+		_ => Err(NotAStar)
+	}
+
+## The columns of a relation as outputs, without those a join merged away.
+rel_outputs : Rel -> Cols
+rel_outputs = |rel|
+	match rel.columns {
+		Known(list) => Known(list.drop_if(|o| rel.hidden.contains(o.name)).map(|o| rel_column(rel, o)))
+		Unknown => Unknown
+	}
+
+## A column of a relation as the query sees it: NULL where an outer join
+## can make it so, and not NULL where the `where` clause rules NULL out.
+rel_column : Rel, Check.Output -> Check.Output
+rel_column = |rel, column|
+	if rel.not_null.contains(column.name) {
+		{ ..column, nullable: No }
+	} else if rel.nullable {
+		{ ..column, nullable: Yes }
+	} else {
+		column
+	}
+
+## The columns a `where` clause keeps only rows where they are not NULL:
+## the operand of `is not null`, and a column a comparison, `in`, `like`,
+## `similar` or `between` reads directly, in conditions joined by `and`.
+## Those operators are NULL for a NULL operand, which `where` drops.
+not_null_refs : Node -> List(Node.ColumnRef)
+not_null_refs = |node| {
+	direct = |operands|
+		operands.keep_oks(
+			|operand|
+				match operand {
+					ColumnRef(c) => Ok(c)
+					_ => Err(NotAColumn)
+				},
+		)
+	match node {
+		BoolExpr(b) if b.boolop == 0 => b.args.fold([], |acc, arg| acc.concat(not_null_refs(arg)))
+		NullTest(t) if t.nulltesttype == 1 => direct([t.arg])
+		AExpr(a) =>
+			if a.kind == 0 and comparison_ops.contains(op_name(a)) {
+				direct([a.lexpr, a.rexpr])
+			} else if [1, 2, 6, 7, 8, 9].contains(a.kind) {
+				direct([a.lexpr])
+			} else if a.kind >= 10 and a.kind <= 13 {
+				direct([a.lexpr])
+			} else {
+				[]
+			}
+		_ => []
+	}
+}
+
+## The relations with the columns `where` rules NULL out marked.
+narrowed : List(Rel), Node -> List(Rel)
+narrowed = |rels, where_clause|
+	not_null_refs(where_clause).fold(
+		rels,
+		|acc, c|
+			match column_ref(c) {
+				Ok(ref) =>
+					match owner(ref, acc) {
+						Ok(rel) => acc.map(|r| if r.alias == rel.alias { ..r, not_null: r.not_null.append(ref.name) } else r)
+						Err(_) => acc
+					}
+				Err(_) => acc
+			},
+	)
+
+known_list : Cols -> List(Check.Output)
+known_list = |outputs|
+	match outputs {
+		Known(list) => list
+		Unknown => []
+	}
+
+visible_names : Rel -> List(Str)
+visible_names = |rel| known_list(rel.columns).map(|c| c.name).drop_if(|name| rel.hidden.contains(name))
+
+## The name, type and nullability of an expression's value. The name is the
+## one Postgres gives a result column that has no alias.
+expr_output : Node, List(Rel), Env -> Check.Output
+expr_output = |node, rels, env| {
+	unknown = { name: "?column?", type: Unknown, nullable: Unknown }
+	match node {
+		ColumnRef(c) =>
+			match column_ref(c) {
+				Ok(ref) =>
+					match resolve(ref, rels, env) {
+						Found(found) => { ..found, name: ref.name }
+						_ => { ..unknown, name: ref.name }
+					}
+				Err(_) => unknown
+			}
+		TypeCast(t) => {
+			inner = expr_output(t.arg, rels, env)
+			name = if inner.name == "?column?" type_last_name(t.type_name) else inner.name
+			{ name, type: type_of(t.type_name), nullable: inner.nullable }
+		}
+		CollateClause(c) => expr_output(c.arg, rels, env)
+		AConst(c) =>
+			if c.isnull {
+				{ ..unknown, nullable: Yes }
+			} else {
+				{ ..unknown, type: const_type(c.val), nullable: No }
+			}
+		FuncCall(f) => func_output(f, rels, env)
+		SubLink(s) => sublink_output(s, rels, env)
+		CoalesceExpr(c) => {
+			args = c.args.map(|arg| expr_output(arg, rels, env))
+			{ name: "coalesce", type: common_type(args), nullable: first_non_null(args) }
+		}
+		MinMaxExpr(m) => {
+			args = m.args.map(|arg| expr_output(arg, rels, env))
+			{ name: if m.op == 0 "greatest" else "least", type: common_type(args), nullable: first_non_null(args) }
+		}
+		CaseExpr(c) => {
+			results = c.args.keep_oks(
+				|arm|
+					match arm {
+						CaseWhen(w) => Ok(expr_output(w.result, rels, env))
+						_ => Err(NotAnArm)
+					},
+			)
+			otherwise =
+				match c.defresult {
+					Null => { ..unknown, nullable: Yes }
+					other => expr_output(other, rels, env)
+				}
+			all = results.append(otherwise)
+			# A branch that reads a column that can be NULL may only run when it
+			# is not, as in `case when x is null then 0 else x end`. So only a
+			# bare NULL, or no `else`, makes the case NULL for sure.
+			nullable =
+				if all.all(|o| o.nullable == No) {
+					No
+				} else if all.any(|o| o.nullable == Yes and o.type == Unknown) {
+					Yes
+				} else {
+					Unknown
+				}
+			{ name: "case", type: common_type(all), nullable }
+		}
+		AArrayExpr(_) => { ..unknown, name: "array", nullable: No }
+		RowExpr(_) => { ..unknown, name: "row", nullable: No }
+		AExpr(a) => aexpr_output(a, rels, env)
+		BoolExpr(b) => { ..unknown, type: Known("boolean"), nullable: all_not_null(b.args.map(|arg| expr_output(arg, rels, env))) }
+		NullTest(_) => { ..unknown, type: Known("boolean"), nullable: No }
+		BooleanTest(_) => { ..unknown, type: Known("boolean"), nullable: No }
+		SQLValueFunction(v) => sql_value_output(v)
+		GroupingFunc(_) => { name: "grouping", type: Known("integer"), nullable: No }
+		_ => unknown
+	}
+}
+
+## The type of a constant. An integer too big for `integer` is a `Float`
+## node in the raw tree.
+const_type : Node -> [Known(Str), Unknown]
+const_type = |val|
+	match val {
+		Integer(_) => Known("integer")
+		Float(f) => {
+			text = f.fval ?? ""
+			if text.contains(".") or text.contains("e") or text.contains("E") Known("numeric") else Known("bigint")
+		}
+		String(_) => Known("text")
+		Boolean(_) => Known("boolean")
+		_ => Unknown
+	}
+
+## The type all of `outputs` share, leaving out bare NULLs.
+common_type : List(Check.Output) -> [Known(Str), Unknown]
+common_type = |outputs| {
+	typed = outputs.drop_if(|o| o.type == Unknown and o.nullable == Yes)
+	match typed.first() {
+		Ok(first) if typed.all(|o| o.type == first.type) => first.type
+		_ => Unknown
+	}
+}
+
+## `coalesce`, `greatest` and `least` are NULL only when every argument is.
+first_non_null : List(Check.Output) -> [Yes, No, Unknown]
+first_non_null = |args|
+	if args.any(|a| a.nullable == No) {
+		No
+	} else if args.all(|a| a.nullable == Yes) {
+		Yes
+	} else {
+		Unknown
+	}
+
+all_not_null : List(Check.Output) -> [Yes, No, Unknown]
+all_not_null = |args| if args.all(|a| a.nullable == No) No else Unknown
+
+comparison_ops = ["=", "<>", "!=", "<", ">", "<=", ">="]
+
+aexpr_output : Node.AExpr, List(Rel), Env -> Check.Output
+aexpr_output = |a, rels, env| {
+	unknown = { name: "?column?", type: Unknown, nullable: Unknown }
+	operands = operand_outputs(a, rels, env)
+	if a.kind == 5 {
+		# nullif(a, b)
+		left = expr_output(a.lexpr, rels, env)
+		{ name: "nullif", type: left.type, nullable: Yes }
+	} else if a.kind == 3 or a.kind == 4 {
+		# is [not] distinct from
+		{ ..unknown, type: Known("boolean"), nullable: No }
+	} else if a.kind != 0 or comparison_ops.contains(op_name(a)) {
+		# Comparisons, any/all, in, like, similar and between.
+		{ ..unknown, type: Known("boolean"), nullable: all_not_null(operands) }
+	} else {
+		operator_output(a, operands, rels, env)
+	}
+}
+
+operand_outputs : Node.AExpr, List(Rel), Env -> List(Check.Output)
+operand_outputs = |a, rels, env|
+	[a.lexpr, a.rexpr]
+		.fold(
+			[],
+			|acc, side|
+				match side {
+					Null => acc
+					NodeList(items) => acc.concat(items)
+					other => acc.append(other)
+				},
+		)
+		.map(|operand| expr_output(operand, rels, env))
+
+op_name : Node.AExpr -> Str
+op_name = |a| names_of(a.name).last() ?? ""
+
+## The operator the server would pick for `a`.
+operator_choice : Node.AExpr, List(Rel), Env -> Try(Overload.Choice, Overload.Miss)
+operator_choice = |a, rels, env|
+	match a.lexpr {
+		Null => Overload.operator(op_name(a), Prefix, arg_of(a.rexpr, rels, env), env.enums)
+		left => Overload.operator(op_name(a), Infix(arg_of(left, rels, env)), arg_of(a.rexpr, rels, env), env.enums)
+	}
+
+operator_output : Node.AExpr, List(Check.Output), List(Rel), Env -> Check.Output
+operator_output = |a, operands, rels, env|
+	match operator_choice(a, rels, env) {
+		Ok(choice) => { name: "?column?", type: choice.result, nullable: operator_nullable(choice, operands, env) }
+		Err(_) => { name: "?column?", type: Unknown, nullable: Unknown }
+	}
+
+## A strict operator is NULL when an operand is. On numbers, strings,
+## dates, times, intervals, booleans and bit strings it is not NULL
+## otherwise: it fails instead, on an overflow say.
+operator_nullable : Overload.Choice, List(Check.Output), Env -> [Yes, No, Unknown]
+operator_nullable = |choice, operands, env| {
+	total = |type|
+		match type {
+			Known(t) => ['N', 'S', 'D', 'T', 'B', 'V'].contains(Overload.category(t, env.enums))
+			Unknown => Bool.False
+		}
+	if choice.strict and operands.any(|o| o.nullable == Yes) {
+		Yes
+	} else if choice.strict and operands.all(|o| o.nullable == No) and total(choice.result) and choice.params.all(|p| p != "" and total(Known(p))) {
+		No
+	} else {
+		Unknown
+	}
+}
+
+## An expression as an argument for picking a function or operator. A
+## string literal, NULL and a parameter have no type yet: the server gives
+## them the type the pick takes there.
+arg_of : Node, List(Rel), Env -> Overload.Arg
+arg_of = |node, rels, env|
+	match node {
+		ParamRef(_) => Untyped
+		AConst(c) =>
+			if c.isnull {
+				Untyped
+			} else {
+				match c.val {
+					String(_) => Untyped
+					other =>
+						match const_type(other) {
+							Known(t) => Known(t)
+							Unknown => Unsure
+						}
+				}
+			}
+		_ =>
+			match expr_output(node, rels, env).type {
+				Known(t) => Known(t)
+				Unknown => Unsure
+			}
+	}
+
+## The function the server would pick for `f`. Named arguments and
+## `variadic` are left to the server.
+function_choice : Node.FuncCall, List(Rel), Env -> Try(Overload.Choice, Overload.Miss)
+function_choice = |f, rels, env| {
+	named =
+		f.args.any(
+			|arg|
+				match arg {
+					NamedArgExpr(_) => Bool.True
+					_ => Bool.False
+				},
+		)
+	if named or f.func_variadic {
+		Err(NoChoice)
+	} else {
+		Overload.function(names_of(f.funcname).last() ?? "", f.args.map(|arg| arg_of(arg, rels, env)), env.enums, env.catalog.functions())
+	}
+}
+
+func_output : Node.FuncCall, List(Rel), Env -> Check.Output
+func_output = |f, rels, env| {
+	name = names_of(f.funcname).last() ?? "?column?"
+	args = f.args.map(|arg| expr_output(arg, rels, env))
+	match function_choice(f, rels, env) {
+		Ok(choice) => {
+			nullable =
+				match choice.kind {
+					Aggregate => aggregate_nullable(name, args, f, env)
+					Window => window_nullable(name, args)
+					Plain => function_nullable(name, choice, args)
+				}
+			{ name, type: choice.result, nullable }
+		}
+		Err(_) => { name, type: Unknown, nullable: Unknown }
+	}
+}
+
+## Functions that return NULL only for a NULL argument.
+total_functions = ["abs", "age", "array_to_string", "ascii", "btrim", "cardinality", "ceil", "ceiling", "char_length", "character_length", "chr", "clock_timestamp", "date_part", "date_trunc", "exp", "extract", "floor", "gen_random_uuid", "initcap", "left", "length", "ln", "log", "lower", "lpad", "ltrim", "make_date", "md5", "mod", "now", "octet_length", "position", "power", "quote_ident", "quote_literal", "random", "repeat", "replace", "reverse", "right", "round", "rpad", "rtrim", "sign", "split_part", "sqrt", "statement_timestamp", "string_to_array", "strpos", "timezone", "to_char", "to_hex", "to_json", "to_jsonb", "transaction_timestamp", "trunc", "upper"]
+
+## Functions that never return NULL.
+never_null_functions = ["concat", "json_build_array", "json_build_object", "jsonb_build_array", "jsonb_build_object", "num_nonnulls", "num_nulls"]
+
+function_nullable : Str, Overload.Choice, List(Check.Output) -> [Yes, No, Unknown]
+function_nullable = |name, choice, args|
+	if never_null_functions.contains(name) {
+		No
+	} else if choice.strict and args.any(|a| a.nullable == Yes) {
+		Yes
+	} else if total_functions.contains(name) and args.all(|a| a.nullable == No) {
+		No
+	} else {
+		Unknown
+	}
+
+## Aggregates that gather their input into one value, never NULL for rows.
+collecting_aggregates = ["array_agg", "json_agg", "jsonb_agg"]
+
+## Aggregates that are NULL for no rows, or rows that are all NULL.
+folding_aggregates = ["avg", "bit_and", "bit_or", "bit_xor", "bool_and", "bool_or", "every", "max", "min", "string_agg", "sum"]
+
+## An aggregate sees no rows when the select has no `group by` and finds
+## none, or when its `filter` keeps none. `count` counts them as 0, the
+## others are NULL.
+aggregate_nullable : Str, List(Check.Output), Node.FuncCall, Env -> [Yes, No, Unknown]
+aggregate_nullable = |name, args, f, env| {
+	folding = folding_aggregates.contains(name)
+	collecting = collecting_aggregates.contains(name)
+	windowed = f.over != Null
+	if name == "count" or name == "regr_count" {
+		No
+	} else if !folding and !collecting {
+		Unknown
+	} else if folding and args.any(|a| a.nullable == Yes) {
+		Yes
+	} else if windowed {
+		Unknown
+	} else if !env.grouped or f.agg_filter != Null {
+		Yes
+	} else if collecting or args.all(|a| a.nullable == No) {
+		No
+	} else {
+		Unknown
+	}
+}
+
+window_nullable : Str, List(Check.Output) -> [Yes, No, Unknown]
+window_nullable = |name, args|
+	match name {
+		"row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist" | "ntile" => No
+		# Without a default, lag and lead are NULL past the partition's edge.
+		"lag" | "lead" => if args.len() < 3 Yes else Unknown
+		_ => Unknown
+	}
+
+sublink_output : Node.SubLink, List(Rel), Env -> Check.Output
+sublink_output = |s, rels, env| {
+	first = || {
+		match statement(s.subselect, { ..env, outer: rels.concat(env.outer) }).outputs {
+			Known([output, ..]) => output
+			_ => { name: "?column?", type: Unknown, nullable: Unknown }
+		}
+	}
+	match s.sub_link_type {
+		0 => { name: "exists", type: Known("boolean"), nullable: No }
+		4 => {
+			# A scalar subquery is NULL when it finds no row.
+			{ ..first(), nullable: Yes }
+		}
+		6 => {
+			element = first()
+			type =
+				match element.type {
+					Known(t) => Known("${t}[]")
+					Unknown => Unknown
+				}
+			{ name: "array", type, nullable: No }
+		}
+		_ => { name: "?column?", type: Known("boolean"), nullable: Unknown }
+	}
+}
+
+sql_value_output : Node.SQLValueFunction -> Check.Output
+sql_value_output = |v| {
+	{ name, type } =
+		match v.op {
+			0 => { name: "current_date", type: "date" }
+			1 | 2 => { name: "current_time", type: "time with time zone" }
+			3 | 4 => { name: "current_timestamp", type: "timestamp with time zone" }
+			5 | 6 => { name: "localtime", type: "time without time zone" }
+			7 | 8 => { name: "localtimestamp", type: "timestamp without time zone" }
+			9 => { name: "current_role", type: "name" }
+			10 => { name: "current_user", type: "name" }
+			11 => { name: "user", type: "name" }
+			12 => { name: "session_user", type: "name" }
+			13 => { name: "current_catalog", type: "name" }
+			_ => { name: "current_schema", type: "name" }
+		}
+	# current_schema is NULL when the search path names no schema that exists.
+	{ name, type: Known(type), nullable: if v.op == 14 Unknown else No }
+}
+
+## The type a `TypeName` names, spelled like [Catalog] spells column types.
+type_of : Node -> [Known(Str), Unknown]
+type_of = |node|
+	match Catalog.type_name(node) {
+		"" => Unknown
+		type => Known(type)
+	}
+
+## The last name of a `TypeName` as the grammar spells it (`int4`), which
+## Postgres names a cast's column after.
+type_last_name : Node -> Str
+type_last_name = |node|
+	match node {
+		TypeName(t) => names_of(t.names).last() ?? "?column?"
+		_ => "?column?"
+	}
+
+Ref : { qualifier : [None, Some(Str)], name : Str }
+
+## A column reference: `col`, `alias.col`, `schema.table.col` or
+## `db.schema.table.col`. Not `*`.
+column_ref : Node.ColumnRef -> Try(Ref, [NotARef])
+column_ref = |c|
+	match c.fields.map(string_of) {
+		[Ok(name)] => Ok({ qualifier: None, name })
+		[.., Ok(qualifier), Ok(name)] => Ok({ qualifier: Some(qualifier), name })
+		_ => Err(NotARef)
+	}
+
+## Find the column a reference names.
+resolve : Ref, List(Rel), Env -> Lookup
+resolve = |ref, rels, env|
+	match ref.qualifier {
+		Some(alias) =>
+			match find_rel(rels, alias) {
+				Ok(rel) => column_in(rel, ref.name)
+				Err(_) =>
+					match find_rel(env.outer, alias) {
+						Ok(rel) => column_in(rel, ref.name)
+						Err(_) => Unsure
+					}
+			}
+		None => {
+			matches = rels.keep_if(|r| visible_names(r).contains(ref.name))
+			match matches {
+				[one] => column_in(one, ref.name)
+				[_, _, ..] => Missing("column `${ref.name}` is ambiguous: it is in ${Str.join_with(matches.map(|r| "`${r.alias}`"), " and ")}")
+				[] =>
+					# A bare relation name is a whole row, not a column.
+					if rels.any(|r| r.columns == Unknown or r.alias == ref.name) {
+						Unsure
+					} else {
+						outer = env.outer.keep_if(|r| visible_names(r).contains(ref.name))
+						match outer {
+							[first, ..] => column_in(first, ref.name)
+							[] =>
+								if rels.is_empty() or env.outer.any(|r| r.columns == Unknown or r.alias == ref.name) {
+									Unsure
+								} else {
+									Missing("column `${ref.name}` does not exist in ${Str.join_with(rels.map(|r| "`${r.alias}`"), " or ")}${Check.suggestion(ref.name, rels.fold([], |acc, r| acc.concat(visible_names(r))))}")
+								}
+						}
+					}
+			}
+		}
+	}
+
+find_rel : List(Rel), Str -> Try(Rel, [NotFound])
+find_rel = |rels, alias| rels.find_first(|r| r.alias == alias)
+
+column_in : Rel, Str -> Lookup
+column_in = |rel, name|
+	match rel.columns {
+		Known(list) =>
+			match list.find_first(|c| c.name == name) {
+				Ok(col) => Found(rel_column(rel, col))
+				Err(_) =>
+					if rel.alias == rel.table {
+						Missing("column `${name}` does not exist in `${rel.table}`${Check.suggestion(name, list.map(|c| c.name))}")
+					} else {
+						Missing("column `${rel.alias}.${name}` does not exist in `${rel.table}`${Check.suggestion(name, list.map(|c| c.name))}")
+					}
+			}
+		Unknown => Unsure
+	}
+
+missing_column : Rel, Str -> Try(Str, [Exists])
+missing_column = |rel, name|
+	match column_in(rel, name) {
+		Missing(problem) => Ok(problem)
+		_ => Err(Exists)
+	}
+
+## Problems in an expression: column references that do not exist,
+## parameters that do not fit the column they are compared with, and
+## whatever a subquery inside it finds.
+expression_problems : Node, List(Rel), Env -> List(Str)
+expression_problems = |node, rels, env| {
+	one = |child| expression_problems(child, rels, env)
+	all = |children| children.fold([], |acc, child| acc.concat(expression_problems(child, rels, env)))
+	match node {
+		ColumnRef(c) =>
+			match column_ref(c) {
+				Ok(ref) =>
+					match resolve(ref, rels, env) {
+						Missing(problem) => [problem]
+						_ => []
+					}
+				Err(_) => []
+			}
+		AExpr(a) => operator_call_problems(a, rels, env).concat(comparison_problems(a, rels, env)).concat(operator_param_problems(a, rels, env)).concat(one(a.lexpr)).concat(one(a.rexpr))
+		BoolExpr(b) => all(b.args)
+		NodeList(items) => all(items)
+		FuncCall(f) => function_call_problems(f, rels, env).concat(function_param_problems(f, rels, env)).concat(all(f.args)).concat(all(f.agg_order)).concat(one(f.agg_filter)).concat(one(f.over))
+		NamedArgExpr(n) => one(n.arg)
+		TypeCast(t) => cast_param_problems(t, env).concat(one(t.arg))
+		CollateClause(c) => one(c.arg)
+		NullTest(t) => one(t.arg)
+		BooleanTest(t) => one(t.arg)
+		CoalesceExpr(c) => all(c.args)
+		MinMaxExpr(m) => all(m.args)
+		CaseExpr(c) => one(c.arg).concat(all(c.args)).concat(one(c.defresult))
+		CaseWhen(w) => one(w.expr).concat(one(w.result))
+		AArrayExpr(a) => all(a.elements)
+		RowExpr(r) => all(r.args)
+		AIndirection(i) => one(i.arg).concat(all(i.indirection))
+		AIndices(i) => one(i.lidx).concat(one(i.uidx))
+		SortBy(s) => one(s.node)
+		WindowDef(w) => all(w.partition_clause).concat(all(w.order_clause)).concat(one(w.start_offset)).concat(one(w.end_offset))
+		GroupingFunc(g) => all(g.args)
+		GroupingSet(g) => all(g.content)
+		ResTarget(t) => one(t.val)
+		MultiAssignRef(m) => one(m.source)
+		SubLink(s) => one(s.testexpr).concat(statement(s.subselect, { ..env, outer: rels.concat(env.outer) }).problems)
+		_ => []
+	}
+}
+
+## Problems of parameters compared with a column: `col = $name`,
+## `$name <> col`, `col in ($a, $b)`, `col between $a and $b` and
+## `col = any($names)`.
+## Whether a call no function or operator takes is refused. Only with a
+## schema that creates no extension: an extension brings functions,
+## operators and casts this does not know, and without a schema the
+## database may have functions of its own.
+refuses_calls : Env -> Bool
+refuses_calls = |env| !env.catalog.is_empty() and env.catalog.extensions().is_empty()
+
+## How an argument reads in a message: its type, or `unknown` for a string
+## literal, NULL or a parameter.
+arg_text : Overload.Arg -> Str
+arg_text = |arg|
+	match arg {
+		Known(t) => t
+		Untyped => "unknown"
+		Unsure => "?"
+	}
+
+## A call of a function that does not exist, or that no function of its
+## name takes.
+function_call_problems : Node.FuncCall, List(Rel), Env -> List(Str)
+function_call_problems = |f, rels, env|
+	if !refuses_calls(env) {
+		[]
+	} else {
+		name = names_of(f.funcname).last() ?? ""
+		match function_choice(f, rels, env) {
+			Err(NoSuchName) => ["function `${name}` does not exist"]
+			Err(NoMatch) => ["function `${name}(${Str.join_with(f.args.map(|arg| arg_text(arg_of(arg, rels, env))), ", ")})` does not exist"]
+			_ => []
+		}
+	}
+
+## An operator between types no operator of its name takes, as in
+## `text_col = int_col`.
+operator_call_problems : Node.AExpr, List(Rel), Env -> List(Str)
+operator_call_problems = |a, rels, env|
+	if !refuses_calls(env) or a.kind != 0 {
+		[]
+	} else {
+		match operator_choice(a, rels, env) {
+			Err(NoMatch) | Err(NoSuchName) => {
+				right = arg_text(arg_of(a.rexpr, rels, env))
+				call =
+					match a.lexpr {
+						Null => "${op_name(a)} ${right}"
+						left => "${arg_text(arg_of(left, rels, env))} ${op_name(a)} ${right}"
+					}
+				["operator `${call}` does not exist"]
+			}
+			_ => []
+		}
+	}
+
+## Problems of parameter `p` where `what` takes `type`: the server gives
+## the parameter that type, so its field must fit it.
+param_type_problems : Node.ParamRef, Str, Str, Env -> List(Str)
+param_type_problems = |p, type, what, env|
+	match param_name(p, env) {
+		Ok(name) =>
+			match env.params.find_first(|q| q.name == name) {
+				Ok(param) if type != "" and !param_fits(type, param.kind) => ["`$${name}` is `${param.kind}`, but ${what} takes `${type}` there"]
+				_ => []
+			}
+		Err(_) => []
+	}
+
+## Problems of parameters that are operands of an operator other than a
+## comparison with a column, which [comparison_problems] reads.
+operator_param_problems : Node.AExpr, List(Rel), Env -> List(Str)
+operator_param_problems = |a, rels, env|
+	if env.params.is_empty() or a.kind != 0 {
+		[]
+	} else if comparison_ops.contains(op_name(a)) {
+		# A parameter compared with an expression of a known type.
+		match (a.lexpr, a.rexpr) {
+			(ParamRef(_), ColumnRef(_)) | (ColumnRef(_), ParamRef(_)) => []
+			(ParamRef(p), other) | (other, ParamRef(p)) =>
+				match expr_output(other, rels, env).type {
+					Known(type) => param_type_problems(p, type, "`${op_name(a)}`", env)
+					Unknown => []
+				}
+			_ => []
+		}
+	} else {
+		match operator_choice(a, rels, env) {
+			Ok(choice) => {
+				operands = if a.lexpr == Null [a.rexpr] else [a.lexpr, a.rexpr]
+				List.map2(operands, choice.params, |operand, type| (operand, type)).fold(
+					[],
+					|acc, (operand, type)|
+						match operand {
+							ParamRef(p) => acc.concat(param_type_problems(p, type, "`${op_name(a)}`", env))
+							_ => acc
+						},
+				)
+			}
+			Err(_) => []
+		}
+	}
+
+## Problems of parameters passed to a function.
+function_param_problems : Node.FuncCall, List(Rel), Env -> List(Str)
+function_param_problems = |f, rels, env|
+	if env.params.is_empty() {
+		[]
+	} else {
+		match function_choice(f, rels, env) {
+			Ok(choice) =>
+				List.map2(f.args, choice.params, |arg, type| (arg, type)).fold(
+					[],
+					|acc, (arg, type)|
+						match arg {
+							ParamRef(p) => acc.concat(param_type_problems(p, type, "`${choice.name}`", env))
+							_ => acc
+						},
+				)
+			Err(_) => []
+		}
+	}
+
+## Problems of a parameter cast to a type, as in `$x::integer`. A cast to a
+## string type takes the text of any value.
+cast_param_problems : Node.TypeCast, Env -> List(Str)
+cast_param_problems = |t, env|
+	match (t.arg, type_of(t.type_name)) {
+		(ParamRef(p), Known(type)) if Overload.category(type, env.enums) != 'S' => param_type_problems(p, type, "the cast", env)
+		_ => []
+	}
+
+comparison_problems : Node.AExpr, List(Rel), Env -> List(Str)
+comparison_problems = |a, rels, env|
+	if env.params.is_empty() {
+		[]
+	} else if a.kind == 0 and comparison_ops.contains(op_name(a)) {
+		match (a.lexpr, a.rexpr) {
+			(ColumnRef(c), ParamRef(p)) => column_param_problems(c, p, Scalar, rels, env)
+			(ParamRef(p), ColumnRef(c)) => column_param_problems(c, p, Scalar, rels, env)
+			_ => []
+		}
+	} else if a.kind == 1 or a.kind == 2 {
+		match (a.lexpr, a.rexpr) {
+			(ColumnRef(c), ParamRef(p)) => column_param_problems(c, p, Array, rels, env)
+			_ => []
+		}
+	} else if a.kind == 6 or (a.kind >= 10 and a.kind <= 13) {
+		match (a.lexpr, a.rexpr) {
+			(ColumnRef(c), NodeList(items)) =>
+				items.fold(
+					[],
+					|acc, item|
+						match item {
+							ParamRef(p) => acc.concat(column_param_problems(c, p, Scalar, rels, env))
+							_ => acc
+						},
+				)
+			_ => []
+		}
+	} else {
+		[]
+	}
+
+## Problems of parameter `p` compared with the column `c` names, as a value
+## or, in `any(...)`, as an array of values.
+column_param_problems : Node.ColumnRef, Node.ParamRef, [Scalar, Array], List(Rel), Env -> List(Str)
+column_param_problems = |c, p, shape, rels, env|
+	match (column_ref(c), param_name(p, env)) {
+		(Ok(ref), Ok(name)) =>
+			match resolve(ref, rels, env) {
+				Found(column) =>
+					match shape {
+						Scalar => param_problems(name, ref.name, column, Bool.False, env)
+						Array => array_param_problems(name, ref.name, column, env)
+					}
+				_ => []
+			}
+		_ => []
+	}
+
+## The name of the parameter at `p`'s location.
+param_name : Node.ParamRef, Env -> Try(Str, [NotFound])
+param_name = |p, env| env.names.find_first(|n| n.at == p.location).map_ok(|n| n.name)
+
+## Problems of parameter `name` meeting `column`: a type it does not fit,
+## and, when the value is stored in the column, NULL where the column takes
+## none.
+param_problems : Str, Str, Check.Output, Bool, Env -> List(Str)
+param_problems = |name, column_name, column, stored, env|
+	match env.params.find_first(|p| p.name == name) {
+		Ok(param) => {
+			type_problem =
+				match column.type {
+					Known(type) if !param_fits(type, param.kind) => ["column `${column_name}` is `${type}`, but `$${name}` is `${param.kind}`"]
+					_ => []
+				}
+			null_problem =
+				if stored and param.nullable and column.nullable == No {
+					["column `${column_name}` is NOT NULL, but `$${name}` is `Try(${param.kind}, [Null])`"]
+				} else {
+					[]
+				}
+			type_problem.concat(null_problem)
+		}
+		Err(_) => []
+	}
+
+## Problems of parameter `name` in `column = any($name)`, which needs a list
+## of values that fit the column.
+array_param_problems : Str, Str, Check.Output, Env -> List(Str)
+array_param_problems = |name, column_name, column, env|
+	match (env.params.find_first(|p| p.name == name), column.type) {
+		(Ok(param), Known(type)) if !param_fits("${type}[]", param.kind) => ["column `${column_name}` is `${type}`, so `$${name}` must be a list of it, but it is `${param.kind}`"]
+		_ => []
+	}
+
+## Whether a parameter that encodes as `kind` fits a column of Postgres
+## type `type`. Types and kinds this does not know always fit, and so does
+## `Str`, which the server parses as the column's type.
+param_fits : Str, Str -> Bool
+param_fits = |type, kind|
+	if kind == "Str" or kind == "" {
+		Bool.True
+	} else if type.ends_with("[]") {
+		if kind.starts_with("List(") {
+			param_fits(type.drop_suffix("[]"), kind.drop_prefix("List(").drop_suffix(")"))
+		} else {
+			Bool.False
+		}
+	} else if kind.starts_with("List(") {
+		!known_type(type)
+	} else if !known_type(type) {
+		Bool.True
+	} else {
+		match kind {
+			"Bool" => booleans.contains(type)
+			"I8" | "I16" | "I32" | "I64" | "U8" | "U16" | "U32" | "U64" => [int2, int4, int8, numeric, float4, float8].any(|group| group.contains(type))
+			"Dec" | "F32" | "F64" => [numeric, float4, float8].any(|group| group.contains(type))
+			_ => Bool.True
+		}
+	}
+
+## The target of an insert, update or delete.
+target_rel : Node, Env -> { rel : Rel, problems : List(Str) }
+target_rel = |node, env|
+	match node {
+		RangeVar(r) => {
+			name = r.relname ?? ""
+			{ columns, problems } = table_columns(name, { ..env, ctes: [] }, is_set(r.schemaname))
+			{ rel: aliased(name, columns, r.alias), problems }
+		}
+		_ => { rel: { alias: "?", table: "?", columns: Unknown, nullable: Bool.False, hidden: [], not_null: [] }, problems: [] }
+	}
+
+returning_list : Node, List(Rel), Env -> Check.Result
+returning_list = |node, rels, env|
+	match node {
+		ReturningClause(r) => target_list(r.exprs, rels, env)
+		_ => { outputs: Known([]), problems: [] }
+	}
+
+## `set col = expr, ...` of an update or of `on conflict do update`: the
+## columns must exist, and a parameter stored in one must fit it.
+set_problems : List(Node), Rel, List(Rel), Env -> List(Str)
+set_problems = |items, target, rels, env| {
+	assignments = items.keep_oks(
+		|item|
+			match item {
+				ResTarget(t) => Ok(t)
+				_ => Err(NotATarget)
+			},
+	)
+	# A column to set is named without the alias.
+	missing = assignments.keep_oks(|t| missing_column({ ..target, alias: target.table }, t.name ?? ""))
+	params = assignments.fold(
+		[],
+		|acc, t|
+			match (t.val, t.indirection) {
+				(ParamRef(p), []) =>
+					match (param_name(p, env), column_in(target, t.name ?? "")) {
+						(Ok(name), Found(column)) => acc.concat(param_problems(name, t.name ?? "", column, Bool.True, env))
+						_ => acc
+					}
+				_ => acc
+			},
+	)
+	stored = assignments.fold(
+		[],
+		|acc, t|
+			match (t.indirection, column_in(target, t.name ?? "")) {
+				([], Found(column)) => acc.concat(value_problems(t.val, t.name ?? "", column, rels, env))
+				_ => acc
+			},
+	)
+	values = assignments.fold([], |acc, t| acc.concat(expression_problems(t.val, rels, env)))
+	missing.concat(params).concat(stored).concat(values)
+}
+
+## Problems of `value` stored in `column`: a type the column cannot take
+## on assignment, or NULL where it takes none. Parameters are checked by
+## [param_problems], and a string literal is parsed by the server.
+value_problems : Node, Str, Check.Output, List(Rel), Env -> List(Str)
+value_problems = |value, column_name, column, rels, env| {
+	typed = |output|
+		match (output.type, column.type) {
+			(Known(from), Known(to)) if !Overload.can_assign(from, to, env.enums) => ["column `${column_name}` is `${to}`, but the value is `${from}`"]
+			_ => []
+		}
+	match value {
+		ParamRef(_) => []
+		SetToDefault(_) => []
+		AConst(c) =>
+			if c.isnull {
+				if column.nullable == No ["column `${column_name}` is NOT NULL, but the value is NULL"] else []
+			} else {
+				match c.val {
+					String(_) => []
+					_ => typed(expr_output(value, rels, env))
+				}
+			}
+		_ => typed(expr_output(value, rels, env))
+	}
+}
+
+## Problems of the shape of what an insert stores: as many values as it
+## names columns, values that fit their columns, and every column that is
+## `NOT NULL` without a default given one. A table with a trigger may fill
+## in a column itself, so it is not held to the last rule.
+insert_shape_problems : Node, List(Str), Rel, Env -> List(Str)
+insert_shape_problems = |source, listed, target, env| {
+	table_columns_list = known_list(target.columns)
+	columns = if listed.is_empty() table_columns_list.map(|c| c.name) else listed
+	{ widths, value_problems: stored } =
+		match source {
+			SelectStmt(sel) if sel.op == 0 and !sel.values_lists.is_empty() => {
+				rows = sel.values_lists.map(
+					|row|
+						match row {
+							NodeList(items) => items
+							_ => []
+						},
+				)
+				stored_problems = rows.fold(
+					[],
+					|acc, items|
+						items.map_with_index(|item, i| (item, i)).fold(
+							acc,
+							|inner, (item, i)|
+								match columns.get(i) {
+									Ok(col) =>
+										match column_in(target, col) {
+											Found(column) => inner.concat(value_problems(item, col, column, [], env))
+											_ => inner
+										}
+									Err(_) => inner
+								},
+						),
+				)
+				{ widths: rows.map(|items| items.len()), value_problems: stored_problems }
+			}
+			Null => { widths: [0], value_problems: [] }
+			query =>
+				match statement(query, env).outputs {
+					Known(outputs) => {
+						stored_problems = outputs.map_with_index(|o, i| (o, i)).fold(
+							[],
+							|acc, (o, i)|
+								match (o.type, columns.get(i).map_ok(|col| (col, column_in(target, col)))) {
+									(Known(from), Ok((col, Found({ type: Known(to), .. })))) if !Overload.can_assign(from, to, env.enums) =>
+										acc.append("column `${col}` is `${to}`, but the query gives `${from}`")
+									_ => acc
+								},
+						)
+						{ widths: [outputs.len()], value_problems: stored_problems }
+					}
+					Unknown => { widths: [], value_problems: [] }
+				}
+		}
+	count_problems =
+		widths.keep_oks(
+			|width|
+				if !listed.is_empty() and width != listed.len() {
+					Ok("the insert names ${listed.len().to_str()} columns but gives ${width.to_str()} values")
+				} else if listed.is_empty() and target.columns != Unknown and width > table_columns_list.len() {
+					Ok("the insert gives ${width.to_str()} values but `${target.table}` has ${table_columns_list.len().to_str()} columns")
+				} else {
+					Err(Fits)
+				},
+		)
+	missing_problems =
+		match (env.catalog.table(target.table), widths.first()) {
+			(Ok({ columns: Known(catalog_columns), triggers: Bool.False, .. }), Ok(width)) => {
+				given = if listed.is_empty() catalog_columns.take_first(width).map(|c| c.name) else listed
+				catalog_columns
+					.keep_if(|c| c.not_null and !c.has_default and !given.contains(c.name))
+					.map(|c| "column `${c.name}` is NOT NULL and has no default, but the insert leaves it out")
+			}
+			_ => []
+		}
+	count_problems.concat(stored).concat(missing_problems)
+}
+
+## `merge into target using source on ... when ... then ...`: the target
+## and source, the join condition, and each clause's condition, update and
+## insert, checked like those of an update and an insert.
+merge_stmt : Node.MergeStmt, Env -> Check.Result
+merge_stmt = |s, env| {
+	{ env: inner, problems: with_problems } = with_env(s.with_clause, env)
+	{ rel: target, problems: table_problems } = target_rel(s.relation, inner)
+	{ rels: source, problems: source_problems } = from_item(s.source_relation, inner)
+	all = [target].concat(source)
+	join_problems = expression_problems(s.join_condition, all, inner)
+	clause_problems = s.merge_when_clauses.fold(
+		[],
+		|acc, clause|
+			match clause {
+				MergeWhenClause(w) => {
+					condition = expression_problems(w.condition, all, inner)
+					action =
+						if w.command_type == 2 {
+							set_problems(w.target_list, target, all, inner)
+						} else if w.command_type == 3 {
+							merge_insert_problems(w, target, source, inner)
+						} else {
+							[]
+						}
+					acc.concat(condition).concat(action)
+				}
+				_ => acc
+			},
+	)
+	returning = returning_list(s.returning_clause, all, inner)
+	{ outputs: returning.outputs, problems: with_problems.concat(table_problems).concat(source_problems).concat(join_problems).concat(clause_problems).concat(returning.problems) }
+}
+
+## `insert (cols) values (...)` of a merge, whose values read the source.
+merge_insert_problems : Node.MergeWhenClause, Rel, List(Rel), Env -> List(Str)
+merge_insert_problems = |w, target, source, env| {
+	listed = w.target_list.keep_oks(
+		|col|
+			match col {
+				ResTarget(t) => t.name.map_err(|_| NoName)
+				_ => Err(NoName)
+			},
+	)
+	columns = if listed.is_empty() known_list(target.columns).map(|c| c.name) else listed
+	missing = listed.keep_oks(|c| missing_column({ ..target, alias: target.table }, c))
+	count =
+		if !listed.is_empty() and w.values.len() != listed.len() {
+			["the insert names ${listed.len().to_str()} columns but gives ${w.values.len().to_str()} values"]
+		} else {
+			[]
+		}
+	stored = w.values.map_with_index(|value, i| (value, i)).fold(
+		[],
+		|acc, (value, i)|
+			match columns.get(i).map_ok(|col| (col, column_in(target, col))) {
+				Ok((col, Found(column))) => {
+					params =
+						match value {
+							ParamRef(p) =>
+								match param_name(p, env) {
+									Ok(name) => param_problems(name, col, column, Bool.True, env)
+									Err(_) => []
+								}
+							_ => []
+						}
+					acc.concat(params).concat(value_problems(value, col, column, source, env))
+				}
+				_ => acc
+			},
+	)
+	values = w.values.fold([], |acc, value| acc.concat(expression_problems(value, source, env)))
+	missing.concat(count).concat(stored).concat(values)
+}
+
+insert_stmt : Node.InsertStmt, Env -> Check.Result
+insert_stmt = |s, env| {
+	{ env: inner, problems: with_problems } = with_env(s.with_clause, env)
+	{ rel: target, problems: table_problems } = target_rel(s.relation, inner)
+	listed = s.cols.keep_oks(
+		|col|
+			match col {
+				ResTarget(t) => t.name.map_err(|_| NoName)
+				_ => Err(NoName)
+			},
+	)
+	column_problems = listed.keep_oks(|c| missing_column({ ..target, alias: target.table }, c))
+	shape_problems = insert_shape_problems(s.select_stmt, listed, target, inner)
+	source_problems =
+		match s.select_stmt {
+			SelectStmt(sel) if sel.op == 0 and !sel.values_lists.is_empty() =>
+				values_problems(sel.values_lists, listed, target, inner).concat(values_select(sel.values_lists, inner).problems)
+			Null => []
+			other => statement(other, inner).problems
+		}
+	excluded = { ..target, alias: "excluded" }
+	conflict_problems =
+		match s.on_conflict_clause {
+			OnConflictClause(c) => set_problems(c.target_list, target, [target, excluded], inner).concat(expression_problems(c.where_clause, [target, excluded], inner))
+			_ => []
+		}
+	returning = returning_list(s.returning_clause, [target], inner)
+	{ outputs: returning.outputs, problems: with_problems.concat(table_problems).concat(column_problems).concat(shape_problems).concat(source_problems).concat(conflict_problems).concat(returning.problems) }
+}
+
+## Problems of the parameters in `values ($a, $b), ...` of an insert into
+## `target`, whose listed columns are `listed` (all of them when empty).
+values_problems : List(Node), List(Str), Rel, Env -> List(Str)
+values_problems = |lists, listed, target, env| {
+	columns = if listed.is_empty() known_list(target.columns).map(|c| c.name) else listed
+	lists.fold(
+		[],
+		|acc, row|
+			match row {
+				NodeList(items) =>
+					items.map_with_index(|item, index| (item, index)).fold(
+						acc,
+						|inner, (item, index)|
+							match (item, columns.get(index)) {
+								(ParamRef(p), Ok(col)) =>
+									match (param_name(p, env), column_in(target, col)) {
+										(Ok(name), Found(column)) => inner.concat(param_problems(name, col, column, Bool.True, env))
+										_ => inner
+									}
+								_ => inner
+							},
+					)
+				_ => acc
+			},
+	)
+}
+
+update_stmt : Node.UpdateStmt, Env -> Check.Result
+update_stmt = |s, env| {
+	{ env: inner, problems: with_problems } = with_env(s.with_clause, env)
+	{ rel: target, problems: table_problems } = target_rel(s.relation, inner)
+	{ rels, problems: from_problems } = from_list(s.from_clause, inner)
+	all = [target].concat(rels)
+	assignment_problems = set_problems(s.target_list, target, all, inner)
+	where_problems = expression_problems(s.where_clause, all, inner)
+	returning = returning_list(s.returning_clause, all, inner)
+	{ outputs: returning.outputs, problems: with_problems.concat(table_problems).concat(from_problems).concat(assignment_problems).concat(where_problems).concat(returning.problems) }
+}
+
+delete_stmt : Node.DeleteStmt, Env -> Check.Result
+delete_stmt = |s, env| {
+	{ env: inner, problems: with_problems } = with_env(s.with_clause, env)
+	{ rel: target, problems: table_problems } = target_rel(s.relation, inner)
+	{ rels, problems: using_problems } = from_list(s.using_clause, inner)
+	all = [target].concat(rels)
+	where_problems = expression_problems(s.where_clause, all, inner)
+	returning = returning_list(s.returning_clause, all, inner)
+	{ outputs: returning.outputs, problems: with_problems.concat(table_problems).concat(using_problems).concat(where_problems).concat(returning.problems) }
+}
+
+string_of : Node -> Try(Str, [NotAString])
+string_of = |node|
+	match node {
+		String(s) =>
+			match s.sval {
+				Ok(text) => Ok(text)
+				Err(_) => Err(NotAString)
+			}
+		_ => Err(NotAString)
+	}
+
+names_of : List(Node) -> List(Str)
+names_of = |nodes| nodes.keep_oks(string_of)
+
+is_set : Node.Text -> Bool
+is_set = |text|
+	match text {
+		Ok(_) => Bool.True
+		Err(_) => Bool.False
+	}
+
+test_schema =
+	\\CREATE TABLE public.students (
+	\\    id integer NOT NULL,
+	\\    name text NOT NULL,
+	\\    phone text,
+	\\    school_id integer NOT NULL
+	\\);
+	\\CREATE TABLE public.schools (
+	\\    id integer NOT NULL,
+	\\    name text NOT NULL
+	\\);
+	\\ALTER TABLE ONLY public.schools ADD CONSTRAINT schools_pkey PRIMARY KEY (id);
+	\\CREATE VIEW public.school_names AS
+	\\ SELECT o.id, o.name, count(r.id) AS students FROM public.schools o LEFT JOIN public.students r ON r.school_id = o.id GROUP BY o.id, o.name;
+	\\CREATE FUNCTION public.student_label(r_id integer, suffix text DEFAULT '') RETURNS text
+	\\    LANGUAGE sql STRICT AS $$ select 'x' $$;
+	\\CREATE FUNCTION public.school_members(o_id integer) RETURNS TABLE(student_id integer, student_name text)
+	\\    LANGUAGE sql AS $$ select 1, 'a' $$;
+
+test_catalog : Catalog
+test_catalog = Catalog.parse(test_schema) ?? Catalog.empty
+
+check : Str -> Check.Result
+check = |sql| {
+	toks = Lex.tokens(sql) ?? []
+	match Parse.parse(Lex.grammar_text(sql, toks)) {
+		Ok([stmt]) => Check.analyze(stmt, test_catalog, [], Lex.named_at(toks))
+		_ => { outputs: Unknown, problems: ["not one statement"] }
+	}
+}
+
+outputs : Str -> List(Str)
+outputs = |sql|
+	match check(sql).outputs {
+		Known(list) =>
+			list.map(
+				|o| {
+					type =
+						match o.type {
+							Known(t) => t
+							Unknown => "?"
+						}
+					nullable =
+						match o.nullable {
+							Yes => " null"
+							No => ""
+							Unknown => " null?"
+						}
+					"${o.name} ${type}${nullable}"
+				},
+			)
+		Unknown => ["unknown"]
+	}
+
+problems : Str -> List(Str)
+problems = |sql| check(sql).problems
+
+expect outputs("select id, name, phone from students where school_id = $o") == ["id integer", "name text", "phone text null"]
+expect problems("select id, name, phone from students where school_id = $o") == []
+expect outputs("select r.id, o.name as school from students r left join schools o on o.id = r.school_id") == ["id integer", "school text null"]
+expect outputs("select r.id, o.name from schools o right join students r on o.id = r.school_id") == ["id integer", "name text null"]
+expect problems("select r.phnoe from students r") == ["column `r.phnoe` does not exist in `students` (did you mean `phone`?)"]
+expect problems("select nme from students") == ["column `nme` does not exist in `students` (did you mean `name`?)"]
+expect outputs("select * from schools") == ["id integer", "name text"]
+expect outputs("select o.* from schools o") == ["id integer", "name text"]
+expect outputs("select count(*) as n from students") == ["n bigint"]
+expect outputs("select count(*) from students") == ["count bigint"]
+expect outputs("select coalesce(phone, '') as phone from students") == ["phone text"]
+expect problems("select x from nope") == ["table `nope` does not exist in the schema"]
+expect problems("insert into students (id, nme, school_id) values ($a, $b, $c) returning id") == ["column `nme` does not exist in `students` (did you mean `name`?)", "column `name` is NOT NULL and has no default, but the insert leaves it out"]
+expect outputs("insert into students (id, name) values ($a, $b) returning id") == ["id integer"]
+expect outputs("insert into students (id, name) values ($a, $b)") == []
+expect problems("update students set phoen = $p where id = $id") == ["column `phoen` does not exist in `students` (did you mean `phone`?)"]
+expect problems("update students r set phone = $p from schools o where o.id = r.school_id and o.nmae = $n") == ["column `o.nmae` does not exist in `schools` (did you mean `name`?)"]
+expect outputs("with recent as (select id from students) select id from recent") == ["id integer"]
+expect outputs("with recent (rid) as (select id from students) select rid from recent") == ["rid integer"]
+expect outputs("select id from students union select id from schools") == ["id integer"]
+expect outputs("select (select name from schools o where o.id = r.school_id) as school_name from students r") == ["school_name text null"]
+expect problems("select (select nme from schools o where o.id = r.school_id) as school_name from students r") == ["column `nme` does not exist in `o` (did you mean `name`?)"]
+expect outputs("select id, name::text, school_id::bigint as school from students") == ["id integer", "name text", "school bigint"]
+expect problems("select id from students r join schools o on o.id = r.school_id") == ["column `id` is ambiguous: it is in `r` and `o`"]
+expect outputs("select t.n from (select count(*) as n from students) t") == ["n bigint"]
+expect outputs("select x.id from unnest($ids) as x(id)") == ["id ? null?"]
+expect outputs("delete from students where id = $id returning id, phone") == ["id integer", "phone text null"]
+expect outputs("select 1") == ["?column? integer"]
+expect outputs("select '1'::integer, null::text as t") == ["int4 integer", "t text null"]
+expect problems("select id from students order by name desc limit 1") == []
+expect problems("select r.id from students r where r.school_id in (select o.id from schools o where o.name = $n)") == []
+expect problems("insert into schools (id, name) values ($id, $name) on conflict (id) do update set name = excluded.name, nmae = excluded.nmae") == ["column `nmae` does not exist in `schools` (did you mean `name`?)", "column `excluded.nmae` does not exist in `schools` (did you mean `name`?)"]
+expect outputs("select distinct on (school_id) id, name from students order by school_id, id") == ["id integer", "name text"]
+expect outputs("select id, exists (select 1 from schools) as any_school from students") == ["id integer", "any_school boolean"]
+
+# What the tree adds over reading tokens.
+expect problems("select id from students where schol_id = $o") == ["column `schol_id` does not exist in `students` (did you mean `school_id`?)"]
+expect problems("select id from students join schools using (id)") == []
+expect outputs("select id from students join schools using (id)") == ["id integer"]
+expect outputs("select * from students natural join schools") == ["id integer", "name text", "phone text null", "school_id integer"]
+expect problems("select name as n from students order by n") == []
+expect problems("select r from students r") == []
+expect outputs("select greatest(id, school_id) as g, nullif(name, '') as n from students") == ["g integer", "n text null"]
+expect outputs("select case when phone is null then 'none' else phone end as p from students") == ["p text null?"]
+expect outputs("select case when id > 1 then name end as n from students") == ["n text null"]
+expect outputs("select array(select id from schools) as ids, current_date") == ["ids integer[]", "current_date date"]
+expect outputs("values (1, 'a'), (2, null)") == ["column1 integer", "column2 text null"]
+expect outputs("select id from students except select school_id from students") == ["id integer"]
+expect Check.compatible("integer", "I32")
+expect !Check.compatible("bigint", "I32")
+expect Check.compatible("bigint", "I64")
+expect Check.compatible("numeric", "Dec")
+expect !Check.compatible("numeric", "F64")
+expect Check.compatible("text", "Str")
+expect Check.suggestion("schol_id", ["id", "school_id"]) == " (did you mean `school_id`?)"
+expect Check.suggestion("phnoe", ["name", "phone"]) == " (did you mean `phone`?)"
+expect Check.suggestion("email", ["id", "name"]) == ""
+expect Check.suggestion("nm", ["name"]) == ""
+expect Check.compatible("bigint", "Str")
+expect !Check.compatible("text", "I32")
+expect Check.compatible("text[]", "List(Str)")
+expect !Check.compatible("text[]", "I32")
+expect Check.compatible("access_level", "Str")
+expect Check.compatible("some_domain", "I32")
+
+# Function calls and operators, typed from Postgres's catalog.
+expect outputs("select sum(id) as total, avg(id) as mean, max(name) as last from students") == ["total bigint null", "mean numeric null", "last text null"]
+expect outputs("select school_id, sum(id) as total, max(phone) as p from students group by school_id") == ["school_id integer", "total bigint", "p text null"]
+expect outputs("select school_id, array_agg(phone) as phones from students group by school_id") == ["school_id integer", "phones text[]"]
+expect outputs("select count(phone) filter (where id > 1) as n, sum(id) filter (where id > 1) as s from students group by school_id") == ["n bigint", "s bigint null"]
+expect outputs("select lower(name), length(phone), upper(phone) as u from students") == ["lower text", "length integer null", "u text null"]
+expect outputs("select id + 1 as next, id * 1.5 as scaled, -id as neg, name || '!' as shout from students") == ["next integer", "scaled numeric", "neg integer", "shout text"]
+expect outputs("select phone || 'x' as p, now() - interval '1 day' as yesterday from students") == ["p text null", "yesterday timestamp with time zone"]
+expect outputs("select concat(name, phone) as c, extract(year from now()) as y from students") == ["c text", "y numeric"]
+expect outputs("select row_number() over (order by id) as n, lag(name) over (order by id) as prev from students") == ["n bigint", "prev text null"]
+expect outputs("select g from generate_series(1, 3) g") == ["g integer null?"]
+expect outputs("select n from generate_series(1, 3) as g(n)") == ["n integer null?"]
+expect outputs("select no_such_function(id) as x from students") == ["x ? null?"]
+
+# Views, and functions of the schema and Postgres's catalog.
+expect outputs("select name, students from school_names") == ["name text", "students bigint"]
+expect problems("select nmae from school_names") == ["column `nmae` does not exist in `school_names` (did you mean `name`?)"]
+expect outputs("select student_label(id) as l, student_label(id, '!') as m from students") == ["l text null?", "m text null?"]
+expect outputs("select student_name from school_members(1)") == ["student_name text null?"]
+expect outputs("select key, value from jsonb_each('{}'::jsonb)") == ["key text null?", "value jsonb null?"]
+expect outputs("select jsonb_set('{}'::jsonb, '{a}', '1') as j") == ["j jsonb null?"]
+
+# Calls no function or operator takes.
+expect problems("select lower(id) from students") == ["function `lower(integer)` does not exist"]
+expect problems("select lowr(name) from students") == ["function `lowr` does not exist"]
+expect problems("select lower(name, name) from students") == ["function `lower(text, text)` does not exist"]
+expect problems("select id from students where name = school_id") == ["operator `text = integer` does not exist"]
+expect problems("select id from students where name = 'x' and school_id = '1' and id + 1.5 > 2") == []
+expect problems("select student_label(id), student_label(id, 'x'), lower(name), -id, not true from students") == []
+expect problems("select count(*), max(name), string_agg(name, ', ') from students") == []
+
+# Grouping.
+expect problems("select school_id, name from students group by school_id") == ["column `name` must appear in `group by` or be used in an aggregate"]
+expect problems("select school_id, count(*) from students group by school_id") == []
+expect problems("select school_id, count(*) from students group by 1") == []
+expect problems("select school_id as o, count(*) from students group by o") == []
+expect problems("select name, count(*) from students") == ["column `name` must appear in `group by` or be used in an aggregate"]
+expect problems("select o.id, o.name, count(r.id) from schools o join students r on r.school_id = o.id group by o.id") == []
+expect problems("select r.id, r.name, count(*) from students r group by r.id") == ["column `r.name` must appear in `group by` or be used in an aggregate"]
+expect problems("select lower(name), count(*) from students group by lower(name)") == []
+expect problems("select lower(name), count(*) from students group by name") == []
+expect problems("select school_id from students group by school_id having count(*) > 1 order by school_id") == []
+expect problems("select school_id, count(*) from students group by school_id order by name") == ["column `name` must appear in `group by` or be used in an aggregate"]
+expect problems("select school_id, sum(id) over (), row_number() over (order by school_id) from students group by school_id") == ["column `id` must appear in `group by` or be used in an aggregate"]
+expect problems("select school_id, sum(sum(id)) over () from students group by school_id") == []
+expect problems("select id, name from students") == []
+
+# Columns `where` rules NULL out.
+expect outputs("select phone from students where phone is not null") == ["phone text"]
+expect outputs("select r.phone from students r where r.id > 1 and r.phone like '+46%'") == ["phone text"]
+expect outputs("select phone from students where phone is not null or id > 1") == ["phone text null"]
+expect outputs("select o.name from students r left join schools o on o.id = r.school_id where o.name = 'x'") == ["name text"]
+expect outputs("select phone from students where phone is distinct from 'x'") == ["phone text null"]
+
+# Merge.
+expect problems("merge into schools o using students r on o.id = r.school_id when matched then update set name = r.name when not matched then insert (id, name) values (r.school_id, r.name)") == []
+expect problems("merge into schools o using students r on o.id = r.schol_id when matched then update set nmae = r.name") == ["column `r.schol_id` does not exist in `students` (did you mean `school_id`?)", "column `nmae` does not exist in `schools` (did you mean `name`?)"]
+expect problems("merge into schools o using students r on o.id = r.school_id when not matched then insert (id, name) values (true, r.name)") == ["column `id` is `integer`, but the value is `boolean`"]
+expect problems("merge into schools o using students r on o.id = r.school_id when not matched then insert (id, name) values (r.school_id)") == ["the insert names 2 columns but gives 1 values"]
+expect outputs("merge into schools o using students r on o.id = r.school_id when matched then delete returning o.id, r.phone") == ["id integer", "phone text null"]
