@@ -1,0 +1,53 @@
+{
+  "schema": "rows: target, operation, history, mean_seconds, seconds_range, mean_peak_gib, peak_gib_range; n=2 per row",
+  "compiler_source_head": "839d32a335d4273f9ffdf972e9bf2d668cce7b9c",
+  "compiler_binary_sha256": "b93d0b0527fa0d2e6e40606f5a5ae386a8f823a47837c58b1a829783c568dd9c",
+  "machine": {"cpu": "10-core Apple Silicon", "ram_gib": 32},
+  "successful_ordinary_commands": 98,
+  "successful_supplemental_diagnostics": 6,
+  "primary": [
+    ["package/main.roc", "check", "cold", 11.895, [11.81, 11.98], 4.055, [4.047, 4.062]],
+    ["package/main.roc", "check", "warm", 6.220, [6.20, 6.24], 3.930, [3.890, 3.969]],
+    ["package/main.roc", "test", "cold", 9.925, [9.89, 9.96], 4.209, [4.174, 4.243]],
+    ["package/main.roc", "test", "warm", 7.075, [7.04, 7.11], 4.577, [4.573, 4.582]],
+    ["examples/query.roc", "check", "cold", 11.630, [11.54, 11.72], 4.091, [4.079, 4.102]],
+    ["examples/query.roc", "check", "warm", 6.385, [6.29, 6.48], 4.063, [4.062, 4.064]],
+    ["examples/query.roc", "llvm", "cold", 34.000, [33.79, 34.21], 8.007, [7.812, 8.201]],
+    ["examples/query.roc", "llvm", "warm", 11.420, [11.36, 11.48], 4.282, [4.279, 4.285]],
+    ["examples/prepared.roc", "check", "cold", 11.495, [11.46, 11.53], 4.099, [4.080, 4.119]],
+    ["examples/prepared.roc", "check", "warm", 6.310, [6.25, 6.37], 3.956, [3.930, 3.983]],
+    ["examples/prepared.roc", "llvm", "cold", 35.260, [34.60, 35.92], 8.048, [7.903, 8.193]],
+    ["examples/prepared.roc", "llvm", "warm", 12.275, [12.23, 12.32], 4.272, [4.242, 4.303]],
+    ["examples/webserver.roc", "check", "cold", 11.635, [11.59, 11.68], 4.115, [4.111, 4.119]],
+    ["examples/webserver.roc", "check", "warm", 6.325, [6.32, 6.33], 4.025, [4.021, 4.030]],
+    ["examples/webserver.roc", "llvm", "cold", 35.370, [35.30, 35.44], 8.462, [8.447, 8.476]],
+    ["examples/webserver.roc", "llvm", "warm", 12.455, [12.44, 12.47], 4.270, [4.252, 4.289]],
+    ["examples/small/main.roc", "check", "cold", 17.120, [17.08, 17.16], 5.507, [5.442, 5.573]],
+    ["examples/small/main.roc", "check", "warm", 12.465, [12.42, 12.51], 5.232, [5.190, 5.273]],
+    ["examples/small/main.roc", "llvm", "cold", 119.005, [118.62, 119.39], 8.494, [8.464, 8.523]],
+    ["examples/small/main.roc", "llvm", "warm", 93.140, [92.34, 93.94], 7.329, [7.197, 7.461]]
+  ],
+  "secondary": [
+    ["examples/query.roc", "dev", "cold", 9.245, [9.13, 9.36], 4.214, [4.201, 4.227]],
+    ["examples/query.roc", "dev", "dev-populated", 0.355, [0.35, 0.36], 0.725, [0.725, 0.726]],
+    ["examples/query.roc", "check", "dev-populated", 0.325, [0.32, 0.33], 0.698, [0.697, 0.699]],
+    ["examples/query.roc", "llvm", "dev-populated", 11.375, [11.37, 11.38], 4.276, [4.202, 4.349]],
+    ["examples/small/main.roc", "dev", "cold", 14.875, [14.87, 14.88], 5.848, [5.775, 5.921]],
+    ["examples/small/main.roc", "dev", "dev-populated", 0.395, [0.39, 0.40], 0.754, [0.752, 0.755]],
+    ["examples/small/main.roc", "check", "dev-populated", 0.330, [0.33, 0.33], 0.712, [0.712, 0.713]],
+    ["examples/small/main.roc", "llvm", "dev-populated", 92.320, [91.95, 92.69], 7.017, [7.016, 7.017]]
+  ],
+  "runtime_edits": [
+    ["examples/query.roc", "dev", "edit", 0.450, [0.45, 0.45], 0.761, [0.761, 0.761]],
+    ["examples/query.roc", "check", "edit-after-dev", 0.325, [0.32, 0.33], 0.698, [0.698, 0.698]],
+    ["examples/query.roc", "llvm", "edit", 11.790, [11.75, 11.83], 4.208, [4.189, 4.227]],
+    ["examples/small/main.roc", "dev", "edit", 1.745, [1.74, 1.75], 1.351, [1.346, 1.357]],
+    ["examples/small/main.roc", "check", "edit-after-dev", 0.330, [0.33, 0.33], 0.727, [0.723, 0.731]],
+    ["examples/small/main.roc", "llvm", "edit", 93.625, [93.38, 93.87], 7.630, [7.616, 7.644]]
+  ],
+  "rss_precision_note": "GiB rounded to 3 decimals; raw byte measurements remain in local evidence",
+  "profile": {"sample_seconds": 10, "main_thread_samples": 6857, "sroa_inclusive_samples": 3618, "promote_mem_to_reg_branch_samples": 2802, "whole_pass_percentage": null},
+  "control": {"changed_semantics": true, "changes": "20 separately named query definitions use the first SQL and row annotation; callsites preserved", "warm_elapsed_seconds": 25.26, "peak_gib": 6.31292724609375, "llvm_opt_emit_ms": 10400, "not_row_only_isolation": true},
+  "pack_read_write_bytes": null,
+  "pack_file_inventory": {"rpk_count": 132, "rpk_bytes": 193868344, "history": "after primary, dev, edits and control; not I/O attribution"}
+}

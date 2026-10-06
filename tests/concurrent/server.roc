@@ -10,7 +10,7 @@
 ## Its streams take no timeout, so the platform's `connect!` goes through
 ## `Client.fixed_timeout`.
 app [Context, program] {
-	pf: platform "https://github.com/niclas-ahden/basic-webserver/releases/download/0.17.0/4rKQRYBACBiwF7fpUzbHXJxhcg73t3wtMXLZMPt9ENwf.tar.zst",
+	pf: platform "https://github.com/niclas-ahden/basic-webserver/releases/download/0.18.0/DuwGgLMnPKEVKXR5KuwtZRAtgap8TSp4GTnFf8ANHtXB.tar.zst",
 	pg: "../../package/main.roc",
 	http: "https://github.com/roc-lang/http/releases/download/1.0.0/6ZUwqYhCS8PU9Mo6MF7oV82ET2o7KYb57CLKDq4cq4sS.tar.zst",
 }

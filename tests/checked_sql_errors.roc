@@ -2,14 +2,14 @@
 ## and expects it to fail with every message listed in `expected_errors` of
 ## tests.roc, each at its query literal.
 app [main!] {
-	pf: platform "https://github.com/niclas-ahden/basic-cli/releases/download/0.27.0/HZanbveSUDoJF8LypR663eH7PpaKEKG36eErEQzmV1Qs.tar.zst",
+	pf: platform "https://github.com/niclas-ahden/basic-cli/releases/download/0.28.0/AP9SGT1yrhCKcFxKcoA5tBkNCM6ibBjBxcQGMTb6krev.tar.zst",
 	pg: "../package/main.roc",
 }
 
 import pf.Stdout
 import pf.Tcp
 import pf.Random
-import pf.OsStr exposing [OsStr]
+import pf.OsStr
 import pg.Client
 import pg.Catalog
 

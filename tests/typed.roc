@@ -6,14 +6,14 @@
 ##
 ##     roc tests/typed.roc <host> <port> <user> <database>
 app [main!] {
-	pf: platform "https://github.com/niclas-ahden/basic-cli/releases/download/0.27.0/HZanbveSUDoJF8LypR663eH7PpaKEKG36eErEQzmV1Qs.tar.zst",
+	pf: platform "https://github.com/niclas-ahden/basic-cli/releases/download/0.28.0/AP9SGT1yrhCKcFxKcoA5tBkNCM6ibBjBxcQGMTb6krev.tar.zst",
 	pg: "../package/main.roc",
 }
 
 import pf.Stdout
 import pf.Tcp
 import pf.Random
-import pf.OsStr exposing [OsStr]
+import pf.OsStr
 import pg.Client
 import pg.Catalog
 
